@@ -17,9 +17,16 @@ pub struct GeminiProvider {
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
+/// Mutable OAuth token state — supports runtime refresh for long-lived processes.
+struct OAuthTokenState {
+    access_token: String,
+    refresh_token: Option<String>,
+    /// Expiry as unix millis. `None` means unknown (treat as potentially expired).
+    expiry_millis: Option<i64>,
+}
+
 /// Resolved credential — the variant determines both the HTTP auth method
 /// and the diagnostic label returned by `auth_source()`.
-#[derive(Debug)]
 enum GeminiAuth {
     /// Explicit API key from config: sent as `?key=` query parameter.
     ExplicitKey(String),
@@ -28,7 +35,8 @@ enum GeminiAuth {
     /// API key from `GOOGLE_API_KEY` env var: sent as `?key=`.
     EnvGoogleKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
-    OAuthToken(String),
+    /// Wrapped in a Mutex to allow runtime token refresh.
+    OAuthToken(Arc<tokio::sync::Mutex<OAuthTokenState>>),
 }
 
 impl GeminiAuth {
@@ -45,13 +53,13 @@ impl GeminiAuth {
         matches!(self, GeminiAuth::OAuthToken(_))
     }
 
-    /// The raw credential string.
-    fn credential(&self) -> &str {
+    /// The raw credential string (for API key variants only).
+    fn api_key_credential(&self) -> &str {
         match self {
             GeminiAuth::ExplicitKey(s)
             | GeminiAuth::EnvGeminiKey(s)
-            | GeminiAuth::EnvGoogleKey(s)
-            | GeminiAuth::OAuthToken(s) => s,
+            | GeminiAuth::EnvGoogleKey(s) => s,
+            GeminiAuth::OAuthToken(_) => "",
         }
     }
 }
@@ -197,9 +205,15 @@ const PUBLIC_API_ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1b
 // TOKEN REFRESH
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Result of a successful token refresh.
+struct RefreshedToken {
+    access_token: String,
+    /// Expiry as unix millis (computed from `expires_in` seconds in the response).
+    expiry_millis: Option<i64>,
+}
+
 /// Refresh an expired Gemini CLI OAuth token using the refresh_token grant.
-/// Uses blocking HTTP because this runs during provider construction (sync).
-fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<String> {
+fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<RefreshedToken> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -231,15 +245,37 @@ fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<String> {
     #[derive(Deserialize)]
     struct TokenResponse {
         access_token: Option<String>,
+        expires_in: Option<i64>,
     }
 
     let parsed: TokenResponse = serde_json::from_str(&body)
         .map_err(|_| anyhow::anyhow!("Gemini CLI OAuth refresh response is not valid JSON"))?;
 
-    parsed
+    let access_token = parsed
         .access_token
         .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Gemini CLI OAuth refresh response missing access_token"))
+        .ok_or_else(|| anyhow::anyhow!("Gemini CLI OAuth refresh response missing access_token"))?;
+
+    let expiry_millis = parsed.expires_in.and_then(|secs| {
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())?;
+        now_millis.checked_add(secs.checked_mul(1000)?)
+    });
+
+    Ok(RefreshedToken {
+        access_token,
+        expiry_millis,
+    })
+}
+
+/// Async version of token refresh for use during runtime (inside tokio context).
+async fn refresh_gemini_cli_token_async(refresh_token: &str) -> anyhow::Result<RefreshedToken> {
+    let refresh_token = refresh_token.to_string();
+    tokio::task::spawn_blocking(move || refresh_gemini_cli_token(&refresh_token))
+        .await
+        .map_err(|e| anyhow::anyhow!("Token refresh task panicked: {e}"))?
 }
 
 impl GeminiProvider {
@@ -256,7 +292,10 @@ impl GeminiProvider {
             .map(GeminiAuth::ExplicitKey)
             .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
             .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
-            .or_else(|| Self::try_load_gemini_cli_token().map(GeminiAuth::OAuthToken));
+            .or_else(|| {
+                Self::try_load_gemini_cli_token()
+                    .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
+            });
 
         Self {
             auth: resolved_auth,
@@ -279,9 +318,11 @@ impl GeminiProvider {
             .and_then(|value| Self::normalize_non_empty(&value))
     }
 
-    /// Try to load OAuth access token from Gemini CLI's cached credentials.
+    /// Try to load OAuth credentials from Gemini CLI's cached credentials.
     /// Location: `~/.gemini/oauth_creds.json`
-    fn try_load_gemini_cli_token() -> Option<String> {
+    ///
+    /// Returns the full `OAuthTokenState` so the provider can refresh at runtime.
+    fn try_load_gemini_cli_token() -> Option<OAuthTokenState> {
         let gemini_dir = Self::gemini_cli_dir()?;
         let creds_path = gemini_dir.join("oauth_creds.json");
 
@@ -292,31 +333,34 @@ impl GeminiProvider {
         let content = std::fs::read_to_string(&creds_path).ok()?;
         let creds: GeminiCliOAuthCreds = serde_json::from_str(&content).ok()?;
 
-        // Check expiry: prefer expiry_date (unix millis) over expiry (RFC 3339)
-        let is_expired = if let Some(expiry_millis) = creds.expiry_date {
-            let now_millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|d| i64::try_from(d.as_millis()).ok())
-                .unwrap_or(i64::MAX);
-            expiry_millis <= now_millis
-        } else if let Some(ref expiry) = creds.expiry {
-            if let Ok(expiry_time) = chrono::DateTime::parse_from_rfc3339(expiry) {
-                expiry_time < chrono::Utc::now()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Determine expiry in millis: prefer expiry_date over expiry (RFC 3339)
+        let expiry_millis = creds.expiry_date.or_else(|| {
+            creds.expiry.as_deref().and_then(|expiry| {
+                chrono::DateTime::parse_from_rfc3339(expiry)
+                    .ok()
+                    .and_then(|dt| i64::try_from(dt.timestamp_millis()).ok())
+            })
+        });
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+
+        let is_expired = expiry_millis.is_some_and(|exp| exp <= now_millis);
 
         if is_expired {
             // Attempt refresh using refresh_token
             if let Some(ref refresh_token) = creds.refresh_token {
                 match refresh_gemini_cli_token(refresh_token) {
-                    Ok(new_token) => {
+                    Ok(refreshed) => {
                         tracing::info!("Gemini CLI OAuth token refreshed successfully");
-                        return Some(new_token);
+                        return Some(OAuthTokenState {
+                            access_token: refreshed.access_token,
+                            refresh_token: Some(refresh_token.clone()),
+                            expiry_millis: refreshed.expiry_millis,
+                        });
                     }
                     Err(err) => {
                         tracing::warn!("Gemini CLI OAuth token refresh failed: {err}");
@@ -331,9 +375,15 @@ impl GeminiProvider {
             }
         }
 
-        creds
+        let access_token = creds
             .access_token
-            .and_then(|token| Self::normalize_non_empty(&token))
+            .and_then(|token| Self::normalize_non_empty(&token))?;
+
+        Some(OAuthTokenState {
+            access_token,
+            refresh_token: creds.refresh_token,
+            expiry_millis,
+        })
     }
 
     /// Get the Gemini CLI config directory (~/.gemini)
@@ -363,6 +413,40 @@ impl GeminiProvider {
             Some(GeminiAuth::OAuthToken(_)) => "Gemini CLI OAuth",
             None => "none",
         }
+    }
+
+    /// Get a valid OAuth access token, refreshing if expired.
+    /// Adds a 60-second buffer before actual expiry to avoid edge-case failures.
+    async fn get_valid_oauth_token(
+        state: &Arc<tokio::sync::Mutex<OAuthTokenState>>,
+    ) -> anyhow::Result<String> {
+        let mut guard = state.lock().await;
+
+        let now_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .unwrap_or(i64::MAX);
+
+        // Refresh if expired or within 60s of expiry
+        let needs_refresh = guard
+            .expiry_millis
+            .is_some_and(|exp| exp <= now_millis.saturating_add(60_000));
+
+        if needs_refresh {
+            if let Some(ref refresh_token) = guard.refresh_token {
+                let refreshed = refresh_gemini_cli_token_async(refresh_token).await?;
+                tracing::info!("Gemini CLI OAuth token refreshed successfully (runtime)");
+                guard.access_token = refreshed.access_token;
+                guard.expiry_millis = refreshed.expiry_millis;
+            } else {
+                anyhow::bail!(
+                    "Gemini CLI OAuth token expired and no refresh_token available — re-run `gemini` to authenticate"
+                );
+            }
+        }
+
+        Ok(guard.access_token.clone())
     }
 
     fn format_model_name(model: &str) -> String {
@@ -395,7 +479,7 @@ impl GeminiProvider {
                 let base_url = format!("{PUBLIC_API_ENDPOINT}/{model_name}:generateContent");
 
                 if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.credential())
+                    format!("{base_url}?key={}", auth.api_key_credential())
                 } else {
                     base_url
                 }
@@ -462,6 +546,10 @@ impl GeminiProvider {
         Ok(project)
     }
 
+    /// Build the HTTP request for generateContent.
+    ///
+    /// For OAuth, pass the resolved `oauth_token` and `project`.
+    /// For API key, both are `None`.
     fn build_generate_content_request(
         &self,
         auth: &GeminiAuth,
@@ -470,10 +558,12 @@ impl GeminiProvider {
         model: &str,
         include_generation_config: bool,
         project: Option<&str>,
+        oauth_token: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let req = self.http_client().post(url).json(request);
         match auth {
-            GeminiAuth::OAuthToken(token) => {
+            GeminiAuth::OAuthToken(_) => {
+                let token = oauth_token.unwrap_or_default();
                 // Internal API expects contents nested inside a `request` field
                 // The internal API expects the raw model name without `models/` prefix,
                 // matching gemini-cli's `toGenerateContentRequest` behavior.
@@ -556,11 +646,13 @@ impl GeminiProvider {
             )
         })?;
 
-        // Resolve project ID for OAuth before building request
-        let project = if auth.is_oauth() {
-            Some(self.resolve_oauth_project(auth.credential()).await?)
+        // For OAuth: get a valid (potentially refreshed) token and resolve project
+        let (oauth_token, project) = if let GeminiAuth::OAuthToken(state) = auth {
+            let token = Self::get_valid_oauth_token(state).await?;
+            let proj = self.resolve_oauth_project(&token).await?;
+            (Some(token), Some(proj))
         } else {
-            None
+            (None, None)
         };
 
         let request = GenerateContentRequest {
@@ -582,6 +674,7 @@ impl GeminiProvider {
                 model,
                 true,
                 project.as_deref(),
+                oauth_token.as_deref(),
             )
             .send()
             .await?;
@@ -603,6 +696,7 @@ impl GeminiProvider {
                         model,
                         false,
                         project.as_deref(),
+                        oauth_token.as_deref(),
                     )
                     .send()
                     .await?;
@@ -718,14 +812,15 @@ impl Provider for GeminiProvider {
 
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(auth) = self.auth.as_ref() {
-            if auth.is_oauth() {
-                // OAuth warmup: resolve project ID (validates token and caches project)
-                self.resolve_oauth_project(auth.credential()).await?;
+            if let GeminiAuth::OAuthToken(state) = auth {
+                // OAuth warmup: get valid token + resolve project ID
+                let token = Self::get_valid_oauth_token(state).await?;
+                self.resolve_oauth_project(&token).await?;
             } else {
                 // API key warmup: list models
                 let url = format!(
                     "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                    auth.credential()
+                    auth.api_key_credential()
                 );
                 self.http_client()
                     .get(&url)
@@ -742,6 +837,15 @@ impl Provider for GeminiProvider {
 mod tests {
     use super::*;
     use reqwest::{header::AUTHORIZATION, StatusCode};
+
+    /// Helper to create a test OAuth auth variant.
+    fn test_oauth_auth(token: &str) -> GeminiAuth {
+        GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(OAuthTokenState {
+            access_token: token.to_string(),
+            refresh_token: None,
+            expiry_millis: None,
+        })))
+    }
 
     #[test]
     fn normalize_non_empty_trims_and_filters() {
@@ -806,7 +910,7 @@ mod tests {
     #[test]
     fn auth_source_oauth() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::OAuthToken("ya29.mock".into())),
+            auth: Some(test_oauth_auth("ya29.mock")),
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
         };
         assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
@@ -833,7 +937,7 @@ mod tests {
 
     #[test]
     fn oauth_url_uses_internal_endpoint() {
-        let auth = GeminiAuth::OAuthToken("ya29.test-token".into());
+        let auth = test_oauth_auth("ya29.test-token");
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
         assert!(url.ends_with(":generateContent"));
@@ -852,10 +956,10 @@ mod tests {
     #[test]
     fn oauth_request_uses_bearer_auth_header() {
         let provider = GeminiProvider {
-            auth: Some(GeminiAuth::OAuthToken("ya29.mock-token".into())),
+            auth: Some(test_oauth_auth("ya29.mock-token")),
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
         };
-        let auth = GeminiAuth::OAuthToken("ya29.mock-token".into());
+        let auth = test_oauth_auth("ya29.mock-token");
         let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
@@ -879,6 +983,7 @@ mod tests {
                 "gemini-2.0-flash",
                 true,
                 Some("test-project"),
+                Some("ya29.mock-token"),
             )
             .build()
             .unwrap();
@@ -915,7 +1020,9 @@ mod tests {
         };
 
         let request = provider
-            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash", true, None)
+            .build_generate_content_request(
+                &auth, &url, &body, "gemini-2.0-flash", true, None, None,
+            )
             .build()
             .unwrap();
 
