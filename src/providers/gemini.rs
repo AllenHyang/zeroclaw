@@ -181,11 +181,17 @@ struct GeminiCliOAuthCreds {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Google OAuth client ID for Gemini CLI (public per Google installed-app spec).
-const GEMINI_CLI_CLIENT_ID: &str =
-    "REDACTED_GEMINI_CLIENT_ID";
+///
+/// Resolved at build time via `GEMINI_CLI_CLIENT_ID` env var, falling back to
+/// the runtime `GEMINI_CLI_CLIENT_ID` env var.  Set the build-time variable in
+/// CI or your local shell before `cargo build`.
+///
+/// Source: <https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/code_assist/oauth2.ts>
+const GEMINI_CLI_CLIENT_ID: Option<&str> = option_env!("GEMINI_CLI_CLIENT_ID");
 
 /// Google OAuth client secret for Gemini CLI (public per Google installed-app spec).
-const GEMINI_CLI_CLIENT_SECRET: &str = "REDACTED_GEMINI_CLIENT_SECRET";
+/// Same resolution strategy as `GEMINI_CLI_CLIENT_ID`.
+const GEMINI_CLI_CLIENT_SECRET: Option<&str> = option_env!("GEMINI_CLI_CLIENT_SECRET");
 
 /// Google OAuth token endpoint.
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
@@ -212,8 +218,35 @@ struct RefreshedToken {
     expiry_millis: Option<i64>,
 }
 
+/// Resolve the Gemini CLI OAuth client ID.
+///
+/// Priority: build-time `option_env!` → runtime `GEMINI_CLI_CLIENT_ID` env var.
+fn gemini_cli_client_id() -> Option<String> {
+    GEMINI_CLI_CLIENT_ID
+        .map(String::from)
+        .or_else(|| std::env::var("GEMINI_CLI_CLIENT_ID").ok())
+}
+
+/// Resolve the Gemini CLI OAuth client secret.
+fn gemini_cli_client_secret() -> Option<String> {
+    GEMINI_CLI_CLIENT_SECRET
+        .map(String::from)
+        .or_else(|| std::env::var("GEMINI_CLI_CLIENT_SECRET").ok())
+}
+
 /// Refresh an expired Gemini CLI OAuth token using the refresh_token grant.
 fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<RefreshedToken> {
+    let client_id = gemini_cli_client_id()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Gemini CLI OAuth client_id not configured. \
+             Set GEMINI_CLI_CLIENT_ID env var at build time or runtime."
+        ))?;
+    let client_secret = gemini_cli_client_secret()
+        .ok_or_else(|| anyhow::anyhow!(
+            "Gemini CLI OAuth client_secret not configured. \
+             Set GEMINI_CLI_CLIENT_SECRET env var at build time or runtime."
+        ))?;
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -227,8 +260,8 @@ fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<RefreshedToke
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", GEMINI_CLI_CLIENT_ID),
-            ("client_secret", GEMINI_CLI_CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
         ])
         .send()
         .map_err(|error| anyhow::anyhow!("Gemini CLI OAuth refresh request failed: {error}"))?;
