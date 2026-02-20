@@ -72,8 +72,8 @@ struct GenerateContentRequest {
 #[derive(Debug, Serialize)]
 struct InternalGenerateContentRequest {
     model: String,
-    #[serde(rename = "generationConfig")]
-    generation_config: GenerationConfig,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GenerationConfig>,
     contents: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<Content>,
@@ -283,6 +283,7 @@ impl GeminiProvider {
         url: &str,
         request: &GenerateContentRequest,
         model: &str,
+        include_generation_config: bool,
     ) -> reqwest::RequestBuilder {
         let req = self.http_client().post(url).json(request);
         match auth {
@@ -290,7 +291,11 @@ impl GeminiProvider {
                 // Internal API expects the model in the request body envelope
                 let internal_request = InternalGenerateContentRequest {
                     model: Self::format_model_name(model),
-                    generation_config: request.generation_config.clone(),
+                    generation_config: if include_generation_config {
+                        Some(request.generation_config.clone())
+                    } else {
+                        None
+                    },
                     contents: request
                         .contents
                         .iter()
@@ -324,6 +329,18 @@ impl GeminiProvider {
             _ => req,
         }
     }
+
+    fn should_retry_oauth_without_generation_config(
+        status: reqwest::StatusCode,
+        error_text: &str,
+    ) -> bool {
+        if status != reqwest::StatusCode::BAD_REQUEST {
+            return false;
+        }
+
+        error_text.contains("Unknown name \"generationConfig\"")
+            || error_text.contains("Unknown name 'generationConfig'")
+    }
 }
 
 impl GeminiProvider {
@@ -355,10 +372,28 @@ impl GeminiProvider {
 
         let url = Self::build_generate_content_url(model, auth);
 
-        let response = self
-            .build_generate_content_request(auth, &url, &request, model)
+        let mut response = self
+            .build_generate_content_request(auth, &url, &request, model, true)
             .send()
             .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            if auth.is_oauth()
+                && Self::should_retry_oauth_without_generation_config(status, &error_text)
+            {
+                tracing::warn!(
+                    "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
+                );
+                response = self
+                    .build_generate_content_request(auth, &url, &request, model, false)
+                    .send()
+                    .await?;
+            } else {
+                anyhow::bail!("Gemini API error ({status}): {error_text}");
+            }
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -483,7 +518,7 @@ impl Provider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::AUTHORIZATION;
+    use reqwest::{header::AUTHORIZATION, StatusCode};
 
     #[test]
     fn normalize_non_empty_trims_and_filters() {
@@ -608,7 +643,7 @@ mod tests {
         };
 
         let request = provider
-            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
+            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash", true)
             .build()
             .unwrap();
 
@@ -643,7 +678,7 @@ mod tests {
         };
 
         let request = provider
-            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash")
+            .build_generate_content_request(&auth, &url, &body, "gemini-2.0-flash", true)
             .build()
             .unwrap();
 
@@ -682,10 +717,10 @@ mod tests {
     fn internal_request_includes_model() {
         let request = InternalGenerateContentRequest {
             model: "models/gemini-3-pro-preview".to_string(),
-            generation_config: GenerationConfig {
+            generation_config: Some(GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
-            },
+            }),
             contents: vec![Content {
                 role: Some("user".to_string()),
                 parts: vec![Part {
@@ -699,6 +734,42 @@ mod tests {
         assert!(json.contains("\"model\":\"models/gemini-3-pro-preview\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("\"temperature\":0.7"));
+    }
+
+    #[test]
+    fn internal_request_omits_generation_config_when_none() {
+        let request = InternalGenerateContentRequest {
+            model: "models/gemini-3-pro-preview".to_string(),
+            generation_config: None,
+            contents: vec![Content {
+                role: Some("user".to_string()),
+                parts: vec![Part {
+                    text: "Hello".to_string(),
+                }],
+            }],
+            system_instruction: None,
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("generationConfig"));
+        assert!(json.contains("\"model\":\"models/gemini-3-pro-preview\""));
+    }
+
+    #[test]
+    fn oauth_retry_detection_for_generation_config_rejection() {
+        let err = "Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field.";
+        assert!(GeminiProvider::should_retry_oauth_without_generation_config(
+            StatusCode::BAD_REQUEST,
+            err
+        ));
+        assert!(!GeminiProvider::should_retry_oauth_without_generation_config(
+            StatusCode::UNAUTHORIZED,
+            err
+        ));
+        assert!(!GeminiProvider::should_retry_oauth_without_generation_config(
+            StatusCode::BAD_REQUEST,
+            "something else"
+        ));
     }
 
     #[test]
