@@ -2903,7 +2903,7 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    // ── Approval manager (supervised mode) ───────────────────────
+    // ── Approval manager (supervised mode, CLI-interactive only) ─
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
     } else {
@@ -2945,6 +2945,7 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
+        let channel_name = if interactive { "cli" } else { "daemon" };
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -2953,7 +2954,7 @@ pub async fn run(
             provider_name,
             model_name,
             temperature,
-            false,
+            !interactive,
             approval_manager.as_ref(),
             channel_name,
             &config.multimodal,
