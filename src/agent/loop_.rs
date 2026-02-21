@@ -283,10 +283,10 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context != "[Memory context]\n" {
-                context.push('\n');
-            } else {
+            if context == "[Memory context]\n" {
                 context.clear();
+            } else {
+                context.push('\n');
             }
         }
     }
@@ -979,7 +979,7 @@ pub(crate) async fn run_tool_call_loop(
         tools_registry.iter().map(|tool| tool.spec()).collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
-    for _iteration in 0..max_iterations {
+    for iteration in 0..max_iterations {
         if cancellation_token
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
@@ -1004,10 +1004,10 @@ pub(crate) async fn run_tool_call_loop(
 
         // ── Progress: LLM thinking ────────────────────────────
         if let Some(ref tx) = on_delta {
-            let phase = if _iteration == 0 {
+            let phase = if iteration == 0 {
                 "\u{1f914} Thinking...\n".to_string()
             } else {
-                format!("\u{1f914} Thinking (round {})...\n", _iteration + 1)
+                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
             };
             let _ = tx.send(phase).await;
         }

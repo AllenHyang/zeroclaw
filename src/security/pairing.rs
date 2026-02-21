@@ -14,6 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Per-client failed attempt counter and lockout time.
+type FailedAttemptMap = HashMap<String, (u32, Option<Instant>)>;
+
 /// Maximum failed pairing attempts before lockout.
 const MAX_PAIR_ATTEMPTS: u32 = 5;
 /// Lockout duration after too many failed pairing attempts.
@@ -36,7 +39,7 @@ pub struct PairingGuard {
     /// Set of SHA-256 hashed bearer tokens (persisted across restarts).
     paired_tokens: Arc<Mutex<HashSet<String>>>,
     /// Brute-force protection: per-client failed attempt counter + lockout time.
-    failed_attempts: Arc<Mutex<HashMap<String, (u32, Option<Instant>)>>>,
+    failed_attempts: Arc<Mutex<FailedAttemptMap>>,
 }
 
 impl PairingGuard {

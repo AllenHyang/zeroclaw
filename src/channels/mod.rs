@@ -1503,6 +1503,14 @@ async fn process_channel_message(
                 started_at.elapsed().as_millis()
             );
 
+            // Close the orphan user turn so subsequent messages don't inherit
+            // this failed request as unfinished context.
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant("[Task failed — not continuing this request]"),
+            );
+
             // Auto-save failure context so it's recoverable via memory_recall.
             if ctx.auto_save_memory {
                 let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
@@ -1559,6 +1567,14 @@ async fn process_channel_message(
                 } else {
                     &tool_summary
                 }
+            );
+
+            // Close the orphan user turn so subsequent messages don't inherit
+            // this timed-out request as unfinished context.
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
 
             // Auto-save timeout context so it's recoverable via memory_recall.

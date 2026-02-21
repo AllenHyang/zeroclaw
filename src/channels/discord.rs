@@ -906,7 +906,11 @@ mod tests {
     #[test]
     fn split_message_many_short_lines() {
         // Many short lines should be batched into chunks under the limit
-        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let msg: String = (0..500).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let parts = split_message_for_discord(&msg);
         for part in &parts {
             assert!(

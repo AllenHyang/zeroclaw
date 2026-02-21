@@ -1,4 +1,6 @@
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
+};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -562,7 +564,10 @@ impl Provider for ReliableProvider {
                         messages: request.messages,
                         tools: request.tools,
                     };
-                    match provider.chat(inner_request, current_model, temperature).await {
+                    match provider
+                        .chat(inner_request, current_model, temperature)
+                        .await
+                    {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -1661,7 +1666,10 @@ mod tests {
         });
 
         let provider = ReliableProvider::new(
-            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            vec![(
+                "mock".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
             0,
             1,
         );
@@ -1691,7 +1699,10 @@ mod tests {
         });
 
         let provider = ReliableProvider::new(
-            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            vec![(
+                "mock".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
             0,
             1,
         );
@@ -1759,7 +1770,10 @@ mod tests {
         });
 
         let provider = ReliableProvider::new(
-            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            vec![(
+                "mock".into(),
+                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+            )],
             2,
             1,
         );
@@ -1785,11 +1799,18 @@ mod tests {
 
         let resp = provider.chat(request, "test-model", 0.7).await.unwrap();
         assert_eq!(resp.text.as_deref(), Some("ok with 2 tools"));
-        assert_eq!(call_count.load(Ordering::SeqCst), 2, "should have retried once");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "should have retried once"
+        );
 
         let seen = mock.tools_seen.lock();
         assert_eq!(seen.len(), 2);
-        assert!(seen.iter().all(|&n| n == 2), "tools must be forwarded on every retry");
+        assert!(
+            seen.iter().all(|&n| n == 2),
+            "tools must be forwarded on every retry"
+        );
     }
 
     // ── Arc wrapper impls for test mocks ──

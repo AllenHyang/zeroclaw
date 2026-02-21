@@ -310,7 +310,27 @@ impl AnthropicProvider {
                 }
                 "tool" => {
                     if let Some(tool_result) = Self::parse_tool_result_message(&msg.content) {
-                        native_messages.push(tool_result);
+                        // Anthropic API requires all tool_results for a single
+                        // assistant turn to be in ONE user message.  Merge into
+                        // the previous user message when it already contains
+                        // tool_result blocks (i.e. consecutive tool messages).
+                        let merged = native_messages.last_mut().and_then(|prev| {
+                            if prev.role == "user"
+                                && prev
+                                    .content
+                                    .iter()
+                                    .all(|b| matches!(b, NativeContentOut::ToolResult { .. }))
+                            {
+                                Some(prev)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(prev) = merged {
+                            prev.content.extend(tool_result.content);
+                        } else {
+                            native_messages.push(tool_result);
+                        }
                     } else {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),

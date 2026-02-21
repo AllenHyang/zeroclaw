@@ -245,7 +245,12 @@ fn gemini_cli_client_secret() -> Option<String> {
 /// Assembled at runtime to avoid triggering secret scanners on push.
 fn default_gemini_cli_client_id() -> String {
     // 681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com
-    ["681255809395", "-oo8ft2oprdrnp9e3aqf6av3hmdib135j", ".apps.googleusercontent.com"].concat()
+    [
+        "681255809395",
+        "-oo8ft2oprdrnp9e3aqf6av3hmdib135j",
+        ".apps.googleusercontent.com",
+    ]
+    .concat()
 }
 
 /// Built-in default client secret from gemini-cli (public, not confidential).
@@ -256,16 +261,18 @@ fn default_gemini_cli_client_secret() -> String {
 
 /// Refresh an expired Gemini CLI OAuth token using the refresh_token grant.
 fn refresh_gemini_cli_token(refresh_token: &str) -> anyhow::Result<RefreshedToken> {
-    let client_id = gemini_cli_client_id()
-        .ok_or_else(|| anyhow::anyhow!(
+    let client_id = gemini_cli_client_id().ok_or_else(|| {
+        anyhow::anyhow!(
             "Gemini CLI OAuth client_id not configured. \
              Set GEMINI_CLI_CLIENT_ID env var at build time or runtime."
-        ))?;
-    let client_secret = gemini_cli_client_secret()
-        .ok_or_else(|| anyhow::anyhow!(
+        )
+    })?;
+    let client_secret = gemini_cli_client_secret().ok_or_else(|| {
+        anyhow::anyhow!(
             "Gemini CLI OAuth client_secret not configured. \
              Set GEMINI_CLI_CLIENT_SECRET env var at build time or runtime."
-        ))?;
+        )
+    })?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -391,7 +398,7 @@ impl GeminiProvider {
             creds.expiry.as_deref().and_then(|expiry| {
                 chrono::DateTime::parse_from_rfc3339(expiry)
                     .ok()
-                    .and_then(|dt| i64::try_from(dt.timestamp_millis()).ok())
+                    .map(|dt| dt.timestamp_millis())
             })
         });
 
@@ -420,12 +427,11 @@ impl GeminiProvider {
                         return None;
                     }
                 }
-            } else {
-                tracing::warn!(
-                    "Gemini CLI OAuth token expired and no refresh_token available — re-run `gemini` to authenticate"
-                );
-                return None;
             }
+            tracing::warn!(
+                "Gemini CLI OAuth token expired and no refresh_token available — re-run `gemini` to authenticate"
+            );
+            return None;
         }
 
         let access_token = creds
@@ -638,19 +644,16 @@ impl GeminiProvider {
                                     .collect(),
                             })
                             .collect(),
-                        system_instruction: request
-                            .system_instruction
-                            .as_ref()
-                            .map(|si| Content {
-                                role: si.role.clone(),
-                                parts: si
-                                    .parts
-                                    .iter()
-                                    .map(|p| Part {
-                                        text: p.text.clone(),
-                                    })
-                                    .collect(),
-                            }),
+                        system_instruction: request.system_instruction.as_ref().map(|si| Content {
+                            role: si.role.clone(),
+                            parts: si
+                                .parts
+                                .iter()
+                                .map(|p| Part {
+                                    text: p.text.clone(),
+                                })
+                                .collect(),
+                        }),
                         generation_config: if include_generation_config {
                             Some(request.generation_config.clone())
                         } else {
@@ -1074,7 +1077,13 @@ mod tests {
 
         let request = provider
             .build_generate_content_request(
-                &auth, &url, &body, "gemini-2.0-flash", true, None, None,
+                &auth,
+                &url,
+                &body,
+                "gemini-2.0-flash",
+                true,
+                None,
+                None,
             )
             .build()
             .unwrap();
@@ -1220,32 +1229,41 @@ mod tests {
         let creds: GeminiCliOAuthCreds = serde_json::from_str(json).unwrap();
         assert_eq!(creds.access_token.as_deref(), Some("ya29.test-token"));
         assert_eq!(creds.refresh_token.as_deref(), Some("1//test-refresh"));
-        assert_eq!(creds.expiry_date, Some(4102444800000));
+        assert_eq!(creds.expiry_date, Some(4_102_444_800_000));
         assert!(creds.expiry.is_none());
     }
 
     #[test]
     fn oauth_retry_detection_for_generation_config_rejection() {
         // Bare quotes (e.g. pre-parsed error string)
-        let err = "Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field.";
-        assert!(GeminiProvider::should_retry_oauth_without_generation_config(
-            StatusCode::BAD_REQUEST,
-            err
-        ));
+        let err =
+            "Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field.";
+        assert!(
+            GeminiProvider::should_retry_oauth_without_generation_config(
+                StatusCode::BAD_REQUEST,
+                err
+            )
+        );
         // JSON-escaped quotes (raw response body from Google API)
         let err_json = r#"Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field."#;
-        assert!(GeminiProvider::should_retry_oauth_without_generation_config(
-            StatusCode::BAD_REQUEST,
-            err_json
-        ));
-        assert!(!GeminiProvider::should_retry_oauth_without_generation_config(
-            StatusCode::UNAUTHORIZED,
-            err
-        ));
-        assert!(!GeminiProvider::should_retry_oauth_without_generation_config(
-            StatusCode::BAD_REQUEST,
-            "something else"
-        ));
+        assert!(
+            GeminiProvider::should_retry_oauth_without_generation_config(
+                StatusCode::BAD_REQUEST,
+                err_json
+            )
+        );
+        assert!(
+            !GeminiProvider::should_retry_oauth_without_generation_config(
+                StatusCode::UNAUTHORIZED,
+                err
+            )
+        );
+        assert!(
+            !GeminiProvider::should_retry_oauth_without_generation_config(
+                StatusCode::BAD_REQUEST,
+                "something else"
+            )
+        );
     }
 
     #[test]

@@ -386,8 +386,9 @@ impl TelegramChannel {
         let contents = fs::read_to_string(&config_path)
             .await
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-        let mut config: Config = toml::from_str(&contents)
-            .context("Failed to parse config.toml — check [channels.telegram] section for syntax errors")?;
+        let mut config: Config = toml::from_str(&contents).context(
+            "Failed to parse config.toml — check [channels.telegram] section for syntax errors",
+        )?;
         config.config_path = config_path;
         config.workspace_dir = zeroclaw_dir.join("workspace");
         Ok(config)
@@ -2921,7 +2922,11 @@ mod tests {
 
     #[test]
     fn telegram_split_many_short_lines() {
-        let msg: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let msg: String = (0..1000).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let parts = split_message_for_telegram(&msg);
         for part in &parts {
             assert!(

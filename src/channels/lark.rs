@@ -509,7 +509,6 @@ impl LarkChannel {
                             match ws_msg {
                                 WsMsg::Binary(b) => b,
                                 WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Pong(_) => continue,
                                 WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
                                 _ => continue,
                             }
@@ -1571,11 +1570,11 @@ fn markdown_to_lark_post(md: &str) -> serde_json::Value {
 
         // ── plain / inline-formatted line ───────────────────────────
         let elems = parse_inline(trimmed);
-        if !elems.is_empty() {
-            lines_out.push(elems);
-        } else {
+        if elems.is_empty() {
             // preserve blank lines as empty text segments
             lines_out.push(vec![serde_json::json!({"tag": "text", "text": ""})]);
+        } else {
+            lines_out.push(elems);
         }
     }
 
