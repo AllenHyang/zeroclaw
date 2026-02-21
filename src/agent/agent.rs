@@ -247,7 +247,7 @@ impl Agent {
             None
         };
 
-        let tools = tools::all_tools_with_runtime(
+        let (tools, _bg_registry) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,

@@ -14,10 +14,34 @@ use anyhow::Result;
 use regex::{Regex, RegexSet};
 use std::fmt::Write;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Tracks last-activity timestamps so callers can implement idle-timeout
+/// instead of wall-clock timeout.
+#[derive(Clone)]
+pub(crate) struct ActivityTracker(Arc<AtomicU64>);
+
+impl ActivityTracker {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(Self::now_secs())))
+    }
+    pub(crate) fn record_activity(&self) {
+        self.0.store(Self::now_secs(), AtomicOrdering::Relaxed);
+    }
+    pub(crate) fn idle_secs(&self) -> u64 {
+        Self::now_secs().saturating_sub(self.0.load(AtomicOrdering::Relaxed))
+    }
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -97,6 +121,29 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+
+/// Minimum interval between progress sends to avoid flooding the draft channel.
+pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+
+/// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
+/// Used before streaming the final answer so progress lines are replaced by the clean response.
+pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+/// Extract a short hint from tool call arguments for progress display.
+fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
+    let hint = match name {
+        "shell" => args.get("command").and_then(|v| v.as_str()),
+        "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
+        _ => args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("query").and_then(|v| v.as_str())),
+    };
+    match hint {
+        Some(s) => truncate_with_ellipsis(s, max_len),
+        None => String::new(),
+    }
+}
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
@@ -885,6 +932,7 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        None,
     )
     .await
 }
@@ -919,6 +967,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    activity: Option<&ActivityTracker>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -952,6 +1001,16 @@ pub(crate) async fn run_tool_call_loop(
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+
+        // ── Progress: LLM thinking ────────────────────────────
+        if let Some(ref tx) = on_delta {
+            let phase = if _iteration == 0 {
+                "\u{1f914} Thinking...\n".to_string()
+            } else {
+                format!("\u{1f914} Thinking (round {})...\n", _iteration + 1)
+            };
+            let _ = tx.send(phase).await;
+        }
 
         observer.record_event(&ObserverEvent::LlmRequest {
             provider: provider_name.to_string(),
@@ -997,6 +1056,9 @@ pub(crate) async fn run_tool_call_loop(
                         success: true,
                         error_message: None,
                     });
+                    if let Some(t) = activity {
+                        t.record_activity();
+                    }
 
                     let response_text = resp.text_or_empty().to_string();
                     // First try native structured tool calls (OpenAI-format).
@@ -1049,11 +1111,26 @@ pub(crate) async fn run_tool_call_loop(
             parsed_text
         };
 
+        // ── Progress: LLM responded ─────────────────────────────
+        if let Some(ref tx) = on_delta {
+            let llm_secs = llm_started_at.elapsed().as_secs();
+            if !tool_calls.is_empty() {
+                let _ = tx
+                    .send(format!(
+                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
+                        tool_calls.len()
+                    ))
+                    .await;
+            }
+        }
+
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
+                // Clear accumulated progress lines before streaming the final answer.
+                let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
@@ -1124,6 +1201,19 @@ pub(crate) async fn run_tool_call_loop(
             observer.record_event(&ObserverEvent::ToolCallStart {
                 tool: call.name.clone(),
             });
+
+            // ── Progress: tool start ────────────────────────────
+            if let Some(ref tx) = on_delta {
+                let hint = truncate_tool_args_for_progress(&call.name, &call.arguments, 60);
+                let progress = if hint.is_empty() {
+                    format!("\u{23f3} {}\n", call.name)
+                } else {
+                    format!("\u{23f3} {}: {hint}\n", call.name)
+                };
+                tracing::debug!(tool = %call.name, "Sending progress start to draft");
+                let _ = tx.send(progress).await;
+            }
+
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
                 let tool_future = tool.execute(call.arguments.clone());
@@ -1161,6 +1251,21 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 format!("Unknown tool: {}", call.name)
             };
+            if let Some(t) = activity {
+                t.record_activity();
+            }
+
+            // ── Progress: tool completion ───────────────────────
+            if let Some(ref tx) = on_delta {
+                let secs = start.elapsed().as_secs();
+                let icon = if result.starts_with("Error") {
+                    "\u{274c}"
+                } else {
+                    "\u{2705}"
+                };
+                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                let _ = tx.send(format!("{icon} {} ({secs}s)\n", call.name)).await;
+            }
 
             individual_results.push(result.clone());
             let _ = writeln!(
@@ -1273,7 +1378,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, _bg_registry) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -1528,6 +1633,7 @@ pub async fn run(
             config.agent.max_tool_iterations,
             None,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1608,9 +1714,7 @@ pub async fn run(
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save
-                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            {
+            if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(&user_key, &user_input, MemoryCategory::Conversation, None)
@@ -1647,6 +1751,7 @@ pub async fn run(
                 "cli",
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                None,
                 None,
                 None,
             )
@@ -1726,7 +1831,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let mut tools_registry = tools::all_tools_with_runtime(
+    let (mut tools_registry, _bg_registry) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -1997,6 +2102,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -2041,6 +2147,7 @@ mod tests {
             3,
             None,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -2077,6 +2184,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
             None,
         )
@@ -2399,7 +2507,7 @@ Done."#;
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(security);
+        let (tools, _bg) = tools::default_tools(security);
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -2416,7 +2524,7 @@ Done."#;
             &crate::config::AutonomyConfig::default(),
             std::path::Path::new("/tmp"),
         ));
-        let tools = tools::default_tools(security);
+        let (tools, _bg) = tools::default_tools(security);
         let formatted = tools_to_openai_format(&tools);
 
         assert!(!formatted.is_empty());

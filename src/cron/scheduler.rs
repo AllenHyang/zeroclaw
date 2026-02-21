@@ -4,8 +4,9 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    due_jobs, list_runs, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
+    SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -117,10 +118,47 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
+/// Maximum number of previous runs to include as context.
+const CRON_HISTORY_LIMIT: usize = 3;
+/// Maximum characters of output to include per previous run.
+const CRON_HISTORY_OUTPUT_CHARS: usize = 500;
+
 async fn run_agent_job(config: &Config, job: &CronJob) -> (bool, String) {
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+
+    // Inject previous execution context so the LLM can recover from failures.
+    let prefixed_prompt = match list_runs(config, &job.id, CRON_HISTORY_LIMIT) {
+        Ok(runs) if !runs.is_empty() => {
+            use std::fmt::Write;
+            let mut ctx = String::from("[Previous executions]\n");
+            for (i, run) in runs.iter().enumerate() {
+                let ts = run.started_at.to_rfc3339();
+                let _ = write!(ctx, "- Run {} ({ts}): {}", i + 1, run.status);
+                if let Some(ref output) = run.output {
+                    let truncated = if output.len() > CRON_HISTORY_OUTPUT_CHARS {
+                        let boundary = output
+                            .char_indices()
+                            .nth(CRON_HISTORY_OUTPUT_CHARS)
+                            .map_or(output.len(), |(idx, _)| idx);
+                        format!("{}...", &output[..boundary])
+                    } else {
+                        output.clone()
+                    };
+                    let _ = write!(ctx, "\n  Output: {truncated}");
+                }
+                ctx.push('\n');
+            }
+            format!("{ctx}\n[Current task]\n{prefixed_prompt}")
+        }
+        Ok(_) => prefixed_prompt,
+        Err(e) => {
+            tracing::warn!("Failed to fetch previous cron runs for context: {e}");
+            prefixed_prompt
+        }
+    };
+
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {

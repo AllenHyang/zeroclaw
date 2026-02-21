@@ -41,25 +41,52 @@ pub struct BackgroundTask {
     pub pid: u32,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub status: BackgroundTaskStatus,
+    /// Originating channel name (for completion notifications).
+    pub notify_channel: Option<String>,
+    /// Originating reply target / chat_id (for completion notifications).
+    pub notify_recipient: Option<String>,
+}
+
+/// Callback invoked when a background task completes or fails.
+/// Arguments: the completed task snapshot and the tail of its log output.
+pub type TaskCompletionCallback = Arc<dyn Fn(BackgroundTask, String) + Send + Sync>;
+
+/// Default notification routing applied to newly inserted tasks.
+#[derive(Debug, Clone, Default)]
+struct DefaultNotifyContext {
+    channel: Option<String>,
+    recipient: Option<String>,
 }
 
 /// In-memory registry of background shell tasks.
 /// Shared between `ShellTool` and `ShellStatusTool` via `Arc`.
 pub struct BackgroundTaskRegistry {
     tasks: parking_lot::Mutex<HashMap<String, BackgroundTask>>,
+    on_complete: parking_lot::Mutex<Option<TaskCompletionCallback>>,
+    default_notify: parking_lot::Mutex<DefaultNotifyContext>,
 }
 
 impl Default for BackgroundTaskRegistry {
     fn default() -> Self {
         Self {
             tasks: parking_lot::Mutex::new(HashMap::new()),
+            on_complete: parking_lot::Mutex::new(None),
+            default_notify: parking_lot::Mutex::new(DefaultNotifyContext::default()),
         }
     }
 }
 
 impl BackgroundTaskRegistry {
     /// Insert a new task. If at capacity, remove oldest completed tasks first.
-    pub fn insert(&self, task: BackgroundTask) {
+    /// Applies the default notification context if the task has no notification fields set.
+    pub fn insert(&self, mut task: BackgroundTask) {
+        // Apply default notification context if not already set.
+        if task.notify_channel.is_none() {
+            let ctx = self.default_notify.lock();
+            task.notify_channel = ctx.channel.clone();
+            task.notify_recipient = ctx.recipient.clone();
+        }
+
         let mut tasks = self.tasks.lock();
         // Evict oldest completed tasks if at capacity.
         while tasks.len() >= MAX_BACKGROUND_TASKS {
@@ -99,6 +126,31 @@ impl BackgroundTaskRegistry {
         list
     }
 
+    /// Set the default notification context applied to all newly inserted tasks.
+    /// Call with channel name and reply target before running agent tool loops.
+    pub fn set_default_notify(&self, channel: String, recipient: String) {
+        let mut ctx = self.default_notify.lock();
+        ctx.channel = Some(channel);
+        ctx.recipient = Some(recipient);
+    }
+
+    /// Clear the default notification context.
+    pub fn clear_default_notify(&self) {
+        let mut ctx = self.default_notify.lock();
+        ctx.channel = None;
+        ctx.recipient = None;
+    }
+
+    /// Register a callback to be invoked when a background task completes or fails.
+    pub fn set_on_complete(&self, cb: TaskCompletionCallback) {
+        *self.on_complete.lock() = Some(cb);
+    }
+
+    /// Return a clone of the current completion callback, if any.
+    pub fn on_complete(&self) -> Option<TaskCompletionCallback> {
+        self.on_complete.lock().clone()
+    }
+
     /// Check if the registry is full (all slots occupied by running tasks).
     pub fn is_full(&self) -> bool {
         let tasks = self.tasks.lock();
@@ -107,6 +159,32 @@ impl BackgroundTaskRegistry {
                 .values()
                 .all(|t| matches!(t.status, BackgroundTaskStatus::Running))
     }
+}
+
+/// Read the last `max_bytes` from a log file. Returns an empty string on error.
+fn read_log_tail(path: &std::path::Path, max_bytes: u64) -> String {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => return String::new(),
+    };
+    let len = metadata.len();
+    let offset = len.saturating_sub(max_bytes);
+    let mut reader = std::io::BufReader::new(file);
+    if offset > 0 {
+        use std::io::Seek;
+        if reader.seek(std::io::SeekFrom::Start(offset)).is_err() {
+            return String::new();
+        }
+    }
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut buf = Vec::with_capacity(cap);
+    use std::io::Read;
+    let _ = reader.take(max_bytes).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 // ── Shell tool ──────────────────────────────────────────────────────
@@ -370,12 +448,15 @@ impl ShellTool {
             pid,
             started_at: chrono::Utc::now(),
             status: BackgroundTaskStatus::Running,
+            notify_channel: None,
+            notify_recipient: None,
         };
         self.bg_registry.insert(task);
 
         // Spawn a monitoring task to update status when the process completes.
         let registry = Arc::clone(&self.bg_registry);
         let monitor_task_id = task_id.clone();
+        let monitor_log_path = log_path.clone();
         tokio::spawn(async move {
             let result =
                 tokio::time::timeout(Duration::from_secs(BACKGROUND_TIMEOUT_SECS), child.wait())
@@ -408,6 +489,14 @@ impl ShellTool {
                             ),
                         },
                     );
+                }
+            }
+
+            // Invoke the completion callback if registered.
+            if let Some(cb) = registry.on_complete() {
+                if let Some(task) = registry.get(&monitor_task_id) {
+                    let tail = read_log_tail(&monitor_log_path, 2048);
+                    cb(task, tail);
                 }
             }
         });
@@ -819,6 +908,8 @@ mod tests {
                 pid: 1000 + (i as u32),
                 started_at: chrono::Utc::now() + chrono::Duration::seconds(i as i64),
                 status: BackgroundTaskStatus::Completed { exit_code: 0 },
+                notify_channel: None,
+                notify_recipient: None,
             };
             registry.insert(task);
         }
@@ -832,6 +923,8 @@ mod tests {
             pid: 9999,
             started_at: chrono::Utc::now() + chrono::Duration::seconds(100),
             status: BackgroundTaskStatus::Running,
+            notify_channel: None,
+            notify_recipient: None,
         };
         registry.insert(new_task);
         assert_eq!(registry.list().len(), MAX_BACKGROUND_TASKS);

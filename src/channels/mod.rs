@@ -56,7 +56,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, ActivityTracker};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -106,6 +106,12 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Minimum tool-loop history growth (messages added) to consider a reply "complex"
+/// and worth auto-saving to memory. Each tool round adds ~2 messages (assistant + tool result),
+/// so 6 messages ≈ 3 tool call rounds.
+const AUTOSAVE_REPLY_MIN_TOOL_MESSAGES: usize = 6;
+/// Maximum characters stored per auto-saved reply summary.
+const AUTOSAVE_REPLY_MAX_CHARS: usize = 500;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -191,6 +197,7 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    bg_registry: Arc<tools::BackgroundTaskRegistry>,
 }
 
 #[derive(Clone)]
@@ -989,6 +996,40 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Strip echoed tool-metadata from the LLM response and fall back to a
+/// tool summary when the model produced no meaningful user-facing text.
+///
+/// Some weaker models (e.g. GLM) parrot back `[Used tools: ...]` or emit
+/// only whitespace after executing tool calls. This function ensures the
+/// user always receives *something* useful.
+fn sanitize_tool_only_reply(response: &str, tool_summary: &str) -> String {
+    // Strip lines that are just tool-metadata echoed by the model.
+    let cleaned: String = response
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            // Remove lines that are only `[Used tools: ...]`
+            !(trimmed.starts_with("[Used tools:") && trimmed.ends_with(']'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        if tool_summary.is_empty() {
+            // No tools were used and no text — shouldn't happen normally,
+            // but return a safe fallback.
+            "(No response generated)".to_string()
+        } else {
+            // Tools were used but model produced no summary — include the
+            // tool list so the user knows something happened.
+            format!("{tool_summary}\n(Task completed)")
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -1211,13 +1252,35 @@ async fn process_channel_message(
         let draft_id = draft_id_ref.to_string();
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
+            let mut last_update = Instant::now();
             while let Some(delta) = rx.recv().await {
+                // CLEAR sentinel: reset accumulated text before final answer streaming.
+                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+                    accumulated.clear();
+                    continue;
+                }
                 accumulated.push_str(&delta);
+                // Throttle draft updates to avoid flooding the channel API.
+                let elapsed = last_update.elapsed();
+                if elapsed < Duration::from_millis(crate::agent::loop_::PROGRESS_MIN_INTERVAL_MS) {
+                    continue;
+                }
+                last_update = Instant::now();
+                tracing::debug!(len = accumulated.len(), "Draft update_draft sending");
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
                 {
                     tracing::debug!("Draft update failed: {e}");
+                }
+            }
+            // Final flush: ensure last accumulated content is sent.
+            if !accumulated.is_empty() {
+                if let Err(e) = channel
+                    .update_draft(&reply_target, &draft_id, &accumulated)
+                    .await
+                {
+                    tracing::debug!("Final draft update failed: {e}");
                 }
             }
         }))
@@ -1238,33 +1301,54 @@ async fn process_channel_message(
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
 
+    // Set default notification context for background tasks spawned during this message.
+    ctx.bg_registry
+        .set_default_notify(msg.channel.clone(), msg.reply_target.clone());
+
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<String, anyhow::Error>),
+        IdleTimeout,
         Cancelled,
     }
 
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(ctx.message_timeout_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                None,
-                msg.channel.as_str(),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-            ),
-        ) => LlmExecutionResult::Completed(result),
+    let activity_tracker = ActivityTracker::new();
+    let idle_limit_secs = ctx.message_timeout_secs;
+
+    let llm_result = {
+        let tool_loop_future = run_tool_call_loop(
+            active_provider.as_ref(),
+            &mut history,
+            ctx.tools_registry.as_ref(),
+            ctx.observer.as_ref(),
+            route.provider.as_str(),
+            route.model.as_str(),
+            runtime_defaults.temperature,
+            true,
+            None,
+            msg.channel.as_str(),
+            &ctx.multimodal,
+            ctx.max_tool_iterations,
+            Some(cancellation_token.clone()),
+            delta_tx,
+            Some(&activity_tracker),
+        );
+        tokio::pin!(tool_loop_future);
+
+        loop {
+            tokio::select! {
+                () = cancellation_token.cancelled() => break LlmExecutionResult::Cancelled,
+                result = &mut tool_loop_future => break LlmExecutionResult::Completed(result),
+                () = tokio::time::sleep(Duration::from_secs(10)) => {
+                    if activity_tracker.idle_secs() >= idle_limit_secs {
+                        break LlmExecutionResult::IdleTimeout;
+                    }
+                }
+            }
+        }
     };
+
+    // Clear default notification context so tasks from other messages don't inherit it.
+    ctx.bg_registry.clear_default_notify();
 
     if let Some(handle) = draft_updater {
         let _ = handle.await;
@@ -1292,7 +1376,7 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(response)) => {
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
@@ -1303,33 +1387,62 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{response}")
             };
 
+            // Guard against degenerate replies: some models (e.g. GLM) may
+            // return empty text or parrot back the tool-summary metadata
+            // instead of producing a human-readable answer after tool calls.
+            // Strip any leading `[Used tools: ...]` line the model echoed,
+            // then fall back to the tool summary if nothing meaningful remains.
+            let reply_for_channel = sanitize_tool_only_reply(&response, &tool_summary);
+
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Auto-save reply summary for complex tasks (3+ tool rounds).
+            let tool_messages_added = history.len().saturating_sub(history_len_before_tools);
+            if ctx.auto_save_memory && tool_messages_added >= AUTOSAVE_REPLY_MIN_TOOL_MESSAGES {
+                let summary = truncate_with_ellipsis(&reply_for_channel, AUTOSAVE_REPLY_MAX_CHARS);
+                let key = format!("reply_{}_{}", msg.channel, msg.id);
+                let content = format!(
+                    "[Task completed] Q: {} | A: {}",
+                    truncate_with_ellipsis(&msg.content, 100),
+                    summary,
+                );
+                let _ = ctx
+                    .memory
+                    .store(
+                        &key,
+                        &content,
+                        crate::memory::MemoryCategory::Conversation,
+                        None,
+                    )
+                    .await;
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
+                truncate_with_ellipsis(&reply_for_channel, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &response)
+                        .finalize_draft(&msg.reply_target, draft_id, &reply_for_channel)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&response, &msg.reply_target)
+                                &SendMessage::new(&reply_for_channel, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(response, &msg.reply_target)
+                        &SendMessage::new(reply_for_channel, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -1338,7 +1451,7 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Ok(Err(e))) => {
+        LlmExecutionResult::Completed(Err(e)) => {
             if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
             {
                 tracing::info!(
@@ -1389,6 +1502,32 @@ async fn process_channel_message(
                 "  ❌ LLM error after {}ms: {e}",
                 started_at.elapsed().as_millis()
             );
+
+            // Auto-save failure context so it's recoverable via memory_recall.
+            if ctx.auto_save_memory {
+                let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+                let key = format!("fail_{}_{}", msg.channel, msg.id);
+                let content = format!(
+                    "[Task failed] Q: {} | Error: {} | Tools used: {}",
+                    truncate_with_ellipsis(&msg.content, 100),
+                    truncate_with_ellipsis(&e.to_string(), 200),
+                    if tool_summary.is_empty() {
+                        "(none)"
+                    } else {
+                        &tool_summary
+                    },
+                );
+                let _ = ctx
+                    .memory
+                    .store(
+                        &key,
+                        &content,
+                        crate::memory::MemoryCategory::Conversation,
+                        None,
+                    )
+                    .await;
+            }
+
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
@@ -1404,24 +1543,68 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmExecutionResult::Completed(Err(_)) => {
-            let timeout_msg = format!("LLM response timed out after {}s", ctx.message_timeout_secs);
-            eprintln!(
-                "  ❌ {} (elapsed: {}ms)",
-                timeout_msg,
-                started_at.elapsed().as_millis()
+        LlmExecutionResult::IdleTimeout => {
+            let elapsed_secs = started_at.elapsed().as_secs();
+            let idle_secs = activity_tracker.idle_secs();
+            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
+            let timeout_msg = format!(
+                "Agent idle timeout after {}s of inactivity (total elapsed: {}s)",
+                idle_secs, elapsed_secs
             );
+            eprintln!(
+                "  ❌ {} (tools: {})",
+                timeout_msg,
+                if tool_summary.is_empty() {
+                    "(none)"
+                } else {
+                    &tool_summary
+                }
+            );
+
+            // Auto-save timeout context so it's recoverable via memory_recall.
+            if ctx.auto_save_memory {
+                let key = format!("timeout_{}_{}", msg.channel, msg.id);
+                let content = format!(
+                    "[Task timed out] Q: {} | {} | Tools used: {}",
+                    truncate_with_ellipsis(&msg.content, 100),
+                    timeout_msg,
+                    if tool_summary.is_empty() {
+                        "(none)"
+                    } else {
+                        &tool_summary
+                    },
+                );
+                let _ = ctx
+                    .memory
+                    .store(
+                        &key,
+                        &content,
+                        crate::memory::MemoryCategory::Conversation,
+                        None,
+                    )
+                    .await;
+            }
+
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = if tool_summary.is_empty() {
+                    format!(
+                        "⚠️ Agent idle timeout after {}s of inactivity (total elapsed: {}s). The model did not respond in time. Please try again.",
+                        idle_secs, elapsed_secs
+                    )
+                } else {
+                    format!(
+                        "⚠️ Agent idle timeout after {}s of inactivity (total elapsed: {}s). {}\nA tool call likely took too long. Please try again or simplify the request.",
+                        idle_secs, elapsed_secs, tool_summary
+                    )
+                };
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &error_text)
                         .await;
                 } else {
                     let _ = channel
                         .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
+                            &SendMessage::new(&error_text, &msg.reply_target)
                                 .in_thread(msg.thread_ts.clone()),
                         )
                         .await;
@@ -2243,7 +2426,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let (tools_vec, bg_registry) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -2256,7 +2439,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    ));
+    );
+    let tools_registry = Arc::new(tools_vec);
 
     let skills = crate::skills::load_skills(&workspace);
 
@@ -2565,6 +2749,53 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Register background task completion callback to notify the originating channel.
+    {
+        let channels_for_cb = Arc::clone(&channels_by_name);
+        bg_registry.set_on_complete(Arc::new(move |task, tail| {
+            let channels = Arc::clone(&channels_for_cb);
+            tokio::spawn(async move {
+                let (channel_name, recipient) =
+                    match (task.notify_channel.as_deref(), task.notify_recipient.as_deref()) {
+                        (Some(ch), Some(rcpt)) => (ch.to_owned(), rcpt.to_owned()),
+                        _ => return, // no notification context — skip silently
+                    };
+                let channel = match channels.get(&channel_name) {
+                    Some(ch) => Arc::clone(ch),
+                    None => return,
+                };
+                let (status_label, exit_info) = match &task.status {
+                    tools::shell::BackgroundTaskStatus::Completed { exit_code } => {
+                        ("completed", format!("exit code {exit_code}"))
+                    }
+                    tools::shell::BackgroundTaskStatus::Failed { error } => {
+                        ("failed", error.clone())
+                    }
+                    tools::shell::BackgroundTaskStatus::Running => return,
+                };
+                let output_preview = if tail.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    tail
+                };
+                let notification = format!(
+                    "Background task {status_label}\nCommand: {}\nStatus: {exit_info}\nOutput (tail):\n{output_preview}",
+                    task.command
+                );
+                if let Err(e) = channel
+                    .send(&SendMessage::new(&notification, &recipient))
+                    .await
+                {
+                    tracing::debug!(
+                        channel = channel.name(),
+                        "Background task notification delivery failed: {e}"
+                    );
+                }
+            });
+        }));
+    }
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
@@ -2603,6 +2834,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        bg_registry,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2728,6 +2960,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3148,6 +3381,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3205,6 +3439,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3271,6 +3506,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3358,6 +3594,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3427,6 +3664,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3511,6 +3749,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3580,6 +3819,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3638,6 +3878,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -3807,6 +4048,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -3885,6 +4127,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -3977,6 +4220,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4049,6 +4293,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -4510,6 +4755,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -4593,6 +4839,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(
@@ -4676,6 +4923,7 @@ mod tests {
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            bg_registry: Arc::new(tools::BackgroundTaskRegistry::default()),
         });
 
         process_channel_message(

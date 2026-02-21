@@ -42,6 +42,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod shell_status;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -72,7 +73,8 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
-pub use shell::ShellTool;
+pub use shell::{BackgroundTaskRegistry, ShellTool};
+pub use shell_status::ShellStatusTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
@@ -86,7 +88,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Create the default tool registry
-pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+pub fn default_tools(
+    security: Arc<SecurityPolicy>,
+) -> (Vec<Box<dyn Tool>>, Arc<BackgroundTaskRegistry>) {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
 }
 
@@ -94,12 +98,19 @@ pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
-) -> Vec<Box<dyn Tool>> {
-    vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+) -> (Vec<Box<dyn Tool>>, Arc<BackgroundTaskRegistry>) {
+    let bg_registry = Arc::new(BackgroundTaskRegistry::default());
+    let tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(ShellTool::new(
+            security.clone(),
+            runtime,
+            bg_registry.clone(),
+        )),
+        Box::new(ShellStatusTool::new(bg_registry.clone())),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security)),
-    ]
+    ];
+    (tools, bg_registry)
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -116,7 +127,7 @@ pub fn all_tools(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> Vec<Box<dyn Tool>> {
+) -> (Vec<Box<dyn Tool>>, Arc<BackgroundTaskRegistry>) {
     all_tools_with_runtime(
         config,
         security,
@@ -148,9 +159,15 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
-) -> Vec<Box<dyn Tool>> {
+) -> (Vec<Box<dyn Tool>>, Arc<BackgroundTaskRegistry>) {
+    let bg_registry = Arc::new(BackgroundTaskRegistry::default());
     let mut tools: Vec<Box<dyn Tool>> = vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new(
+            security.clone(),
+            runtime,
+            bg_registry.clone(),
+        )),
+        Box::new(ShellStatusTool::new(bg_registry.clone())),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(CronAddTool::new(config.clone(), security.clone())),
@@ -260,7 +277,7 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    tools
+    (tools, bg_registry)
 }
 
 #[cfg(test)]
@@ -278,10 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_has_three() {
+    fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
-        assert_eq!(tools.len(), 3);
+        let (tools, _bg) = default_tools(security);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -304,7 +321,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _bg) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -344,7 +361,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _bg) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -366,7 +383,7 @@ mod tests {
     #[test]
     fn default_tools_names() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let (tools, _bg) = default_tools(security);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
@@ -376,7 +393,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_descriptions() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let (tools, _bg) = default_tools(security);
         for tool in &tools {
             assert!(
                 !tool.description().is_empty(),
@@ -389,7 +406,7 @@ mod tests {
     #[test]
     fn default_tools_all_have_schemas() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let (tools, _bg) = default_tools(security);
         for tool in &tools {
             let schema = tool.parameters_schema();
             assert!(
@@ -408,7 +425,7 @@ mod tests {
     #[test]
     fn tool_spec_generation() {
         let security = Arc::new(SecurityPolicy::default());
-        let tools = default_tools(security);
+        let (tools, _bg) = default_tools(security);
         for tool in &tools {
             let spec = tool.spec();
             assert_eq!(spec.name, tool.name());
@@ -485,7 +502,7 @@ mod tests {
             },
         );
 
-        let tools = all_tools(
+        let (tools, _bg) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -517,7 +534,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let tools = all_tools(
+        let (tools, _bg) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,

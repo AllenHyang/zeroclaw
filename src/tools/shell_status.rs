@@ -259,6 +259,8 @@ mod tests {
             pid: 12345,
             started_at: chrono::Utc::now(),
             status: BackgroundTaskStatus::Running,
+            notify_channel: None,
+            notify_recipient: None,
         });
         (registry, task_id)
     }
@@ -373,6 +375,8 @@ mod tests {
             pid: 1,
             started_at: chrono::Utc::now(),
             status: BackgroundTaskStatus::Running,
+            notify_channel: None,
+            notify_recipient: None,
         });
         let tool = ShellStatusTool::new(registry);
         let result = tool
