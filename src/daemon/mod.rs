@@ -72,6 +72,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    if config.goal_loop.enabled {
+        let goal_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "goal-loop",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = goal_cfg.clone();
+                Box::pin(async move { Box::pin(run_goal_loop_worker(cfg)).await })
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("goal-loop");
+        tracing::info!("Goal loop disabled; goal-loop supervisor not started");
+    }
+
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -90,7 +106,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, goal-loop, scheduler");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -360,6 +376,168 @@ async fn deliver_heartbeat(
     }
 
     Ok(())
+}
+
+// ── Goal Loop Worker ─────────────────────────────────────────────
+
+async fn run_goal_loop_worker(config: Config) -> Result<()> {
+    use crate::goals::engine::{GoalEngine, GoalStatus, StepStatus};
+
+    let engine = GoalEngine::new(&config.workspace_dir);
+    let interval_mins = config.goal_loop.interval_minutes.max(1);
+    let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
+    let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
+
+    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+
+    loop {
+        interval.tick().await;
+
+        let mut state = match engine.load_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Goal loop: failed to load state: {e}");
+                continue;
+            }
+        };
+
+        if state.goals.is_empty() {
+            continue;
+        }
+
+        for _ in 0..max_steps {
+            let Some((gi, si)) = GoalEngine::select_next_actionable(&state) else {
+                break;
+            };
+
+            // Mark step in_progress
+            state.goals[gi].steps[si].status = StepStatus::InProgress;
+            let _ = engine.save_state(&state).await;
+
+            let prompt =
+                GoalEngine::build_step_prompt(&state.goals[gi], &state.goals[gi].steps[si]);
+            let temp = config.default_temperature;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let success = GoalEngine::interpret_result(&output);
+                    if success {
+                        state.goals[gi].steps[si].status = StepStatus::Completed;
+                        state.goals[gi].steps[si].result = Some(truncate_output(&output, 500));
+                        // Append to goal context
+                        let step_desc = state.goals[gi].steps[si].description.clone();
+                        let summary = truncate_output(&output, 200);
+                        use std::fmt::Write as _;
+                        let _ = write!(state.goals[gi].context, "\n- {step_desc}: {summary}");
+                        state.goals[gi].last_error = None;
+
+                        crate::health::mark_component_ok("goal-loop");
+                    } else {
+                        state.goals[gi].steps[si].status = StepStatus::Pending;
+                        state.goals[gi].steps[si].attempts += 1;
+                        state.goals[gi].last_error = Some(truncate_output(&output, 200));
+
+                        if state.goals[gi].steps[si].attempts >= GoalEngine::max_step_attempts() {
+                            state.goals[gi].status = GoalStatus::Blocked;
+                            state.goals[gi].last_error = Some(format!(
+                                "Step '{}' failed {} times",
+                                state.goals[gi].steps[si].description,
+                                state.goals[gi].steps[si].attempts,
+                            ));
+                            notify_goal_event(
+                                &config,
+                                &format!(
+                                    "Goal '{}' blocked: step '{}' failed {} times",
+                                    state.goals[gi].description,
+                                    state.goals[gi].steps[si].description,
+                                    state.goals[gi].steps[si].attempts,
+                                ),
+                            )
+                            .await;
+                            let _ = engine.save_state(&state).await;
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    state.goals[gi].steps[si].status = StepStatus::Pending;
+                    state.goals[gi].steps[si].attempts += 1;
+                    state.goals[gi].last_error = Some(e.to_string());
+                    tracing::warn!(
+                        "Goal loop step error (attempt {}): {e}",
+                        state.goals[gi].steps[si].attempts
+                    );
+                    crate::health::mark_component_error("goal-loop", e.to_string());
+                    let _ = engine.save_state(&state).await;
+                    break;
+                }
+                Err(_elapsed) => {
+                    state.goals[gi].steps[si].status = StepStatus::Pending;
+                    state.goals[gi].steps[si].attempts += 1;
+                    state.goals[gi].last_error = Some("step execution timed out".into());
+                    tracing::warn!(
+                        "Goal loop step timed out (attempt {})",
+                        state.goals[gi].steps[si].attempts
+                    );
+                    crate::health::mark_component_error("goal-loop", "step timed out");
+                    let _ = engine.save_state(&state).await;
+                    break;
+                }
+            }
+
+            // Check if all steps done → goal completed
+            let all_done = state.goals[gi]
+                .steps
+                .iter()
+                .all(|s| s.status == StepStatus::Completed);
+            if all_done {
+                state.goals[gi].status = GoalStatus::Completed;
+                state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                notify_goal_event(
+                    &config,
+                    &format!("Goal completed: {}", state.goals[gi].description),
+                )
+                .await;
+                let _ = engine.save_state(&state).await;
+                break;
+            }
+
+            let _ = engine.save_state(&state).await;
+        }
+    }
+}
+
+/// Send a goal event notification via the configured channel (best-effort).
+async fn notify_goal_event(config: &Config, message: &str) {
+    if let (Some(ch_name), Some(target)) = (&config.goal_loop.channel, &config.goal_loop.target) {
+        if let Err(e) = deliver_heartbeat(config, ch_name, target, message).await {
+            tracing::warn!("Goal event delivery to {ch_name} failed: {e}");
+        }
+    } else {
+        tracing::info!("Goal event (no delivery channel): {message}");
+    }
+}
+
+fn truncate_output(output: &str, max_len: usize) -> String {
+    if output.len() <= max_len {
+        output.to_string()
+    } else {
+        format!("{}...", &output[..max_len])
+    }
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
