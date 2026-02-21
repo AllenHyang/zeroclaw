@@ -1,4 +1,4 @@
-use super::traits::{ChatMessage, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
 use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
@@ -542,6 +542,115 @@ impl Provider for ReliableProvider {
         self.providers
             .iter()
             .any(|(_, provider)| provider.supports_vision())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let models = self.model_chain(model);
+        let mut failures = Vec::new();
+
+        for current_model in &models {
+            for (provider_name, provider) in &self.providers {
+                let mut backoff_ms = self.base_backoff_ms;
+
+                for attempt in 0..=self.max_retries {
+                    let inner_request = ChatRequest {
+                        messages: request.messages,
+                        tools: request.tools,
+                    };
+                    match provider.chat(inner_request, current_model, temperature).await {
+                        Ok(resp) => {
+                            if attempt > 0 || *current_model != model {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt,
+                                    original_model = model,
+                                    "Provider recovered (failover/retry)"
+                                );
+                            }
+                            return Ok(resp);
+                        }
+                        Err(e) => {
+                            let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
+                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            let rate_limited = is_rate_limited(&e);
+                            let failure_reason = failure_reason(rate_limited, non_retryable);
+                            let error_detail = compact_error_detail(&e);
+
+                            push_failure(
+                                &mut failures,
+                                provider_name,
+                                current_model,
+                                attempt + 1,
+                                self.max_retries + 1,
+                                failure_reason,
+                                &error_detail,
+                            );
+
+                            if rate_limited && !non_retryable_rate_limit {
+                                if let Some(new_key) = self.rotate_key() {
+                                    tracing::info!(
+                                        provider = provider_name,
+                                        error = %error_detail,
+                                        "Rate limited, rotated API key (key ending ...{})",
+                                        &new_key[new_key.len().saturating_sub(4)..]
+                                    );
+                                }
+                            }
+
+                            if non_retryable {
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    error = %error_detail,
+                                    "Non-retryable error, moving on"
+                                );
+
+                                if is_context_window_exceeded(&e) {
+                                    anyhow::bail!(
+                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
+                                        failures.join("\n")
+                                    );
+                                }
+
+                                break;
+                            }
+
+                            if attempt < self.max_retries {
+                                let wait = self.compute_backoff(backoff_ms, &e);
+                                tracing::warn!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    attempt = attempt + 1,
+                                    backoff_ms = wait,
+                                    reason = failure_reason,
+                                    error = %error_detail,
+                                    "Provider call failed, retrying"
+                                );
+                                tokio::time::sleep(Duration::from_millis(wait)).await;
+                                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                            }
+                        }
+                    }
+                }
+
+                tracing::warn!(
+                    provider = provider_name,
+                    model = *current_model,
+                    "Exhausted retries, trying next provider/model"
+                );
+            }
+        }
+
+        anyhow::bail!(
+            "All providers/models failed. Attempts:\n{}",
+            failures.join("\n")
+        )
     }
 
     async fn chat_with_tools(
@@ -1501,6 +1610,243 @@ mod tests {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
+        }
+    }
+
+    // ── Tool-aware mock: verifies chat() forwards tools correctly ──
+
+    struct ToolAwareMock {
+        /// Number of tools received in the last chat() call.
+        tools_received: parking_lot::Mutex<Option<usize>>,
+        /// Whether to report native tool support.
+        native_tools: bool,
+    }
+
+    #[async_trait]
+    impl Provider for ToolAwareMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
+        async fn chat(
+            &self,
+            request: super::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<super::ChatResponse> {
+            let tool_count = request.tools.map(|t| t.len()).unwrap_or(0);
+            *self.tools_received.lock() = Some(tool_count);
+            Ok(super::ChatResponse {
+                text: Some(format!("received {} tools", tool_count)),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_forwards_tools_to_inner_provider() {
+        let mock = Arc::new(ToolAwareMock {
+            tools_received: parking_lot::Mutex::new(None),
+            native_tools: true,
+        });
+
+        let provider = ReliableProvider::new(
+            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            0,
+            1,
+        );
+
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "run a command".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let messages = vec![ChatMessage::user("use shell to list files")];
+        let request = super::ChatRequest {
+            messages: &messages,
+            tools: Some(&tools),
+        };
+
+        let resp = provider.chat(request, "test-model", 0.7).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("received 1 tools"));
+        assert_eq!(*mock.tools_received.lock(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn chat_forwards_none_tools_when_absent() {
+        let mock = Arc::new(ToolAwareMock {
+            tools_received: parking_lot::Mutex::new(None),
+            native_tools: true,
+        });
+
+        let provider = ReliableProvider::new(
+            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = super::ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let resp = provider.chat(request, "test-model", 0.7).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("received 0 tools"));
+        assert_eq!(*mock.tools_received.lock(), Some(0));
+    }
+
+    // ── RetryToolMock: verifies tools are forwarded on retries ──
+
+    struct RetryToolMock {
+        calls: Arc<AtomicUsize>,
+        tools_seen: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for RetryToolMock {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat(
+            &self,
+            request: super::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<super::ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let tool_count = request.tools.map(|t| t.len()).unwrap_or(0);
+            self.tools_seen.lock().push(tool_count);
+            if attempt <= 1 {
+                anyhow::bail!("transient error");
+            }
+            Ok(super::ChatResponse {
+                text: Some(format!("ok with {} tools", tool_count)),
+                tool_calls: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_retries_and_forwards_tools() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let mock = Arc::new(RetryToolMock {
+            calls: Arc::clone(&call_count),
+            tools_seen: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        let provider = ReliableProvider::new(
+            vec![("mock".into(), Box::new(Arc::clone(&mock)) as Box<dyn Provider>)],
+            2,
+            1,
+        );
+
+        let tools = vec![
+            crate::tools::ToolSpec {
+                name: "shell".to_string(),
+                description: "run a command".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            crate::tools::ToolSpec {
+                name: "read_file".to_string(),
+                description: "read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let messages = vec![ChatMessage::user("do something")];
+        let request = super::ChatRequest {
+            messages: &messages,
+            tools: Some(&tools),
+        };
+
+        let resp = provider.chat(request, "test-model", 0.7).await.unwrap();
+        assert_eq!(resp.text.as_deref(), Some("ok with 2 tools"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "should have retried once");
+
+        let seen = mock.tools_seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|&n| n == 2), "tools must be forwarded on every retry");
+    }
+
+    // ── Arc wrapper impls for test mocks ──
+
+    #[async_trait]
+    impl Provider for Arc<ToolAwareMock> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.as_ref().supports_native_tools()
+        }
+
+        async fn chat(
+            &self,
+            request: super::ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<super::ChatResponse> {
+            self.as_ref().chat(request, model, temperature).await
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<RetryToolMock> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.as_ref().supports_native_tools()
+        }
+
+        async fn chat(
+            &self,
+            request: super::ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<super::ChatResponse> {
+            self.as_ref().chat(request, model, temperature).await
         }
     }
 }
