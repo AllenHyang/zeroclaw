@@ -122,12 +122,11 @@ impl ShellTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
-        bg_registry: Arc<BackgroundTaskRegistry>,
     ) -> Self {
         Self {
             security,
             runtime,
-            bg_registry,
+            bg_registry: Arc::new(BackgroundTaskRegistry::default()),
         }
     }
 }
