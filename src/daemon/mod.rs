@@ -313,7 +313,9 @@ async fn deliver_heartbeat(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
             let channel = crate::channels::LarkChannel::from_config(lk);
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send_card(target, "🦀 ZeroClaw 心跳报告", output)
+                .await?;
         }
         "telegram" => {
             let tg = config
