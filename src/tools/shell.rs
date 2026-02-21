@@ -129,6 +129,25 @@ impl ShellTool {
             bg_registry: Arc::new(BackgroundTaskRegistry::default()),
         }
     }
+
+    /// Construct with an externally-provided registry so callers can share it
+    /// with `ShellStatusTool`.
+    pub fn with_registry(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        bg_registry: Arc<BackgroundTaskRegistry>,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            bg_registry,
+        }
+    }
+
+    /// Return a handle to the background task registry.
+    pub fn registry(&self) -> &Arc<BackgroundTaskRegistry> {
+        &self.bg_registry
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
