@@ -59,6 +59,7 @@ mod cron;
 mod daemon;
 mod doctor;
 mod gateway;
+mod goals;
 mod hardware;
 mod health;
 mod heartbeat;
@@ -702,9 +703,17 @@ async fn main() -> Result<()> {
             model,
             temperature,
             peripheral,
-        } => agent::run(config, message, provider, model, temperature, peripheral, true)
-            .await
-            .map(|_| ()),
+        } => agent::run(
+            config,
+            message,
+            provider,
+            model,
+            temperature,
+            peripheral,
+            true,
+        )
+        .await
+        .map(|_| ()),
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

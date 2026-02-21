@@ -48,6 +48,7 @@ pub mod cron;
 pub mod daemon;
 pub mod doctor;
 pub mod gateway;
+pub mod goals;
 pub mod hardware;
 pub mod health;
 pub mod heartbeat;
