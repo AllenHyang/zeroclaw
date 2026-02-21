@@ -57,6 +57,8 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);
