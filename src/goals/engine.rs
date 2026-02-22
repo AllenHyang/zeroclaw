@@ -274,19 +274,44 @@ impl GoalEngine {
         Self::append_goals_by_status(&mut prompt, state);
 
         prompt.push_str(
-            "Instructions:\n\
-             1. Use memory_recall to review recent consolidation entries and daily activity\n\
-             2. Consider the user's mission areas (from SOUL.md if available)\n\
-             3. Check for unfinished threads: blocked goals that might be unblockable now,\n\
-             \x20  pending goals that need updates, or follow-ups to completed goals\n\
-             4. If you identify a valuable new direction:\n\
-             \x20  a. VERIFY the precondition first (e.g., check if data exists before proposing\n\
-             \x20     to process it, check if a service is reachable before proposing to use it)\n\
-             \x20  b. Only if preconditions hold: write a new goal to state/goals.json with\n\
+            "Instructions:\n\n\
+             == Phase 1: Recall and Reflect ==\n\
+             1. Use memory_recall with query \"exploration journal\" to retrieve your past\n\
+             \x20  exploration entries. Review what you explored before, what you found,\n\
+             \x20  and what directions you suggested for next time.\n\
+             2. Use memory_recall to review recent daily activity and consolidation entries.\n\
+             3. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
+             4. REFLECT on your exploration history:\n\
+             \x20  - Am I stuck in a rut, repeating the same topics?\n\
+             \x20  - Did my previous explorations produce actionable results, or just noise?\n\
+             \x20  - Has the user's situation changed (new conversations, new priorities)?\n\
+             \x20  - What blind spots might I have? What am I NOT looking at?\n\n\
+             == Phase 2: Explore with Intent ==\n\
+             5. Based on your reflection, choose ONE direction to explore. Prefer:\n\
+             \x20  - Directions you suggested in your last journal entry\n\
+             \x20  - Blind spots or areas you haven't covered recently\n\
+             \x20  - Follow-ups to completed goals that might have new developments\n\
+             \x20  - Unblocking stuck goals with fresh approaches\n\
+             \x20  Over: repeating recent topics, or picking whatever is easiest.\n\
+             6. If you identify a valuable new goal:\n\
+             \x20  a. VERIFY the precondition first (e.g., check if data exists, if a\n\
+             \x20     service is reachable, if the user hasn't already addressed it)\n\
+             \x20  b. Only if preconditions hold: write it to state/goals.json with\n\
              \x20     status \"pending\", priority \"low\", and 3-5 concrete steps\n\
-             \x20  c. Notify the user with a brief rationale\n\
-             5. If nothing valuable surfaces, just say so briefly. Do not force a goal.\n\
-             6. Keep this lightweight — max 5 tool calls.\n",
+             \x20  c. Notify the user with a brief rationale\n\n\
+             == Phase 3: Journal ==\n\
+             7. ALWAYS end by writing an exploration journal entry using memory_store.\n\
+             \x20  Use key \"exploration-journal-YYYY-MM-DD-N\" (N = sequence number today).\n\
+             \x20  Use category \"exploration\". Include:\n\
+             \x20  - What you explored and why\n\
+             \x20  - Key findings (or \"nothing notable\")\n\
+             \x20  - Self-critique: what went well, what was wasted effort\n\
+             \x20  - 2-3 specific directions for next exploration (not vague, be concrete)\n\
+             \x20  - Any shifts in your mental model of the user's priorities\n\n\
+             == Constraints ==\n\
+             - Max 8 tool calls total.\n\
+             - If nothing valuable surfaces, say so briefly. Do not force a goal.\n\
+             - Quality over quantity. One deep insight beats five shallow scans.\n",
         );
 
         prompt
@@ -1020,8 +1045,16 @@ target = "oc_test"
         assert!(prompt.contains("== Completed goals ==\n(none)"));
         assert!(prompt.contains("== Blocked goals ==\n(none)"));
         assert!(prompt.contains("== Pending goals (awaiting approval) ==\n(none)"));
-        assert!(prompt.contains("memory_recall"));
+        // Phase 1: Recall and Reflect
+        assert!(prompt.contains("exploration journal"));
+        assert!(prompt.contains("REFLECT on your exploration history"));
+        assert!(prompt.contains("blind spots"));
+        // Phase 2: Explore with Intent
         assert!(prompt.contains("VERIFY the precondition"));
+        // Phase 3: Journal
+        assert!(prompt.contains("memory_store"));
+        assert!(prompt.contains("exploration-journal-"));
+        assert!(prompt.contains("Self-critique"));
     }
 
     #[test]
