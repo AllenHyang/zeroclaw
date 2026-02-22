@@ -6980,6 +6980,8 @@ default_model = "legacy-model"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -7000,6 +7002,8 @@ default_model = "legacy-model"
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -7236,5 +7240,89 @@ require_otp_to_resume = true
             .validate()
             .expect_err("expected ttl validation failure");
         assert!(err.to_string().contains("token_ttl_secs"));
+    }
+
+    // ── is_temp_directory unit tests ───────────────────────────
+
+    #[test]
+    async fn is_temp_directory_detects_os_temp_root() {
+        let temp = std::env::temp_dir();
+        assert!(
+            is_temp_directory(&temp),
+            "OS temp dir itself should be detected as temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_existing_child_of_temp() {
+        let child = std::env::temp_dir().join("zeroclaw_is_temp_test_child");
+        std::fs::create_dir_all(&child).ok();
+        assert!(
+            is_temp_directory(&child),
+            "existing child of temp dir should be detected"
+        );
+        std::fs::remove_dir_all(&child).ok();
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_deeply_nested_existing_temp_child() {
+        let nested = std::env::temp_dir()
+            .join("zeroclaw_is_temp_test_deep")
+            .join("nested")
+            .join("workspace");
+        std::fs::create_dir_all(&nested).ok();
+        assert!(
+            is_temp_directory(&nested),
+            "deeply nested existing child of temp dir should be detected"
+        );
+        std::fs::remove_dir_all(
+            std::env::temp_dir().join("zeroclaw_is_temp_test_deep"),
+        )
+        .ok();
+    }
+
+    #[test]
+    async fn is_temp_directory_detects_tempfile_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(
+            is_temp_directory(tmp.path()),
+            "tempfile::TempDir path should be detected as temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_home_path() {
+        let home = PathBuf::from("/Users/zeroclaw_user/.zeroclaw");
+        assert!(
+            !is_temp_directory(&home),
+            "home directory path should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_absolute_project_path() {
+        let project = PathBuf::from("/opt/zeroclaw/workspace");
+        assert!(
+            !is_temp_directory(&project),
+            "project path under /opt should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_etc_path() {
+        let etc = PathBuf::from("/etc/zeroclaw");
+        assert!(
+            !is_temp_directory(&etc),
+            "/etc path should not be temp"
+        );
+    }
+
+    #[test]
+    async fn is_temp_directory_rejects_nonexistent_path_outside_temp() {
+        let nonexistent = PathBuf::from("/nonexistent/zeroclaw/workspace");
+        assert!(
+            !is_temp_directory(&nonexistent),
+            "nonexistent path outside temp should not be detected as temp"
+        );
     }
 }

@@ -649,4 +649,281 @@ target = "oc_test"
         assert!(prompt.contains("policy_denied"));
         assert!(prompt.contains("memory_store"));
     }
+
+    // ── Self-healing deserialization tests ───────────────────────
+
+    #[test]
+    fn goal_status_deserializes_all_valid_variants() {
+        let cases = vec![
+            ("\"pending\"", GoalStatus::Pending),
+            ("\"in_progress\"", GoalStatus::InProgress),
+            ("\"completed\"", GoalStatus::Completed),
+            ("\"blocked\"", GoalStatus::Blocked),
+            ("\"cancelled\"", GoalStatus::Cancelled),
+        ];
+        for (json_str, expected) in cases {
+            let parsed: GoalStatus =
+                serde_json::from_str(json_str).unwrap_or_else(|e| panic!("{json_str}: {e}"));
+            assert_eq!(parsed, expected, "GoalStatus mismatch for {json_str}");
+        }
+    }
+
+    #[test]
+    fn goal_status_self_healing_unknown_variants() {
+        for variant in &["\"unknown\"", "\"invalid\"", "\"PENDING\"", "\"IN_PROGRESS\"", "\"\""] {
+            let parsed: GoalStatus =
+                serde_json::from_str(variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+            assert_eq!(parsed, GoalStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn step_status_deserializes_all_valid_variants() {
+        let cases = vec![
+            ("\"pending\"", StepStatus::Pending),
+            ("\"in_progress\"", StepStatus::InProgress),
+            ("\"completed\"", StepStatus::Completed),
+            ("\"failed\"", StepStatus::Failed),
+            ("\"blocked\"", StepStatus::Blocked),
+        ];
+        for (json_str, expected) in cases {
+            let parsed: StepStatus =
+                serde_json::from_str(json_str).unwrap_or_else(|e| panic!("{json_str}: {e}"));
+            assert_eq!(parsed, expected, "StepStatus mismatch for {json_str}");
+        }
+    }
+
+    #[test]
+    fn step_status_self_healing_unknown_variants() {
+        for variant in &["\"unknown\"", "\"done\"", "\"FAILED\"", "\"\""] {
+            let parsed: StepStatus =
+                serde_json::from_str(variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+            assert_eq!(parsed, StepStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn goal_status_self_healing_in_full_goal_json() {
+        let json = r#"{"id":"g1","description":"test","status":"totally_bogus","steps":[]}"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert_eq!(goal.status, GoalStatus::Pending);
+    }
+
+    // ── find_stalled_goals edge cases ───────────────────────────
+
+    #[test]
+    fn find_stalled_goals_empty_steps_not_stalled() {
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "No steps".into(),
+                status: GoalStatus::InProgress,
+                priority: GoalPriority::High,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![],
+                context: String::new(),
+                last_error: None,
+            }],
+        };
+        assert!(GoalEngine::find_stalled_goals(&state).is_empty());
+    }
+
+    #[test]
+    fn find_stalled_goals_multiple_stalled() {
+        let stalled_goal = |id: &str| Goal {
+            id: id.into(),
+            description: format!("Stalled {id}"),
+            status: GoalStatus::InProgress,
+            priority: GoalPriority::Medium,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![Step {
+                id: "s1".into(),
+                description: "Exhausted".into(),
+                status: StepStatus::Pending,
+                result: None,
+                attempts: MAX_STEP_ATTEMPTS,
+            }],
+            context: String::new(),
+            last_error: None,
+        };
+        let state = GoalState {
+            goals: vec![stalled_goal("g1"), stalled_goal("g2"), stalled_goal("g3")],
+        };
+        assert_eq!(GoalEngine::find_stalled_goals(&state), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn find_stalled_goals_all_steps_completed_is_stalled() {
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "All done but still in-progress".into(),
+                status: GoalStatus::InProgress,
+                priority: GoalPriority::High,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![
+                    Step {
+                        id: "s1".into(),
+                        description: "Done".into(),
+                        status: StepStatus::Completed,
+                        result: Some("ok".into()),
+                        attempts: 1,
+                    },
+                    Step {
+                        id: "s2".into(),
+                        description: "Also done".into(),
+                        status: StepStatus::Completed,
+                        result: Some("ok".into()),
+                        attempts: 1,
+                    },
+                ],
+                context: String::new(),
+                last_error: None,
+            }],
+        };
+        assert_eq!(GoalEngine::find_stalled_goals(&state), vec![0]);
+    }
+
+    #[test]
+    fn find_stalled_goals_mix_completed_and_blocked_steps() {
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "Mixed".into(),
+                status: GoalStatus::InProgress,
+                priority: GoalPriority::High,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![
+                    Step {
+                        id: "s1".into(),
+                        description: "Done".into(),
+                        status: StepStatus::Completed,
+                        result: Some("ok".into()),
+                        attempts: 1,
+                    },
+                    Step {
+                        id: "s2".into(),
+                        description: "Blocked".into(),
+                        status: StepStatus::Blocked,
+                        result: None,
+                        attempts: 0,
+                    },
+                ],
+                context: String::new(),
+                last_error: None,
+            }],
+        };
+        assert_eq!(GoalEngine::find_stalled_goals(&state), vec![0]);
+    }
+
+    // ── build_reflection_prompt edge cases ───────────────────────
+
+    #[test]
+    fn build_reflection_prompt_empty_context_omits_section() {
+        let goal = Goal {
+            id: "g1".into(),
+            description: "Empty context".into(),
+            status: GoalStatus::InProgress,
+            priority: GoalPriority::High,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![Step {
+                id: "s1".into(),
+                description: "Step".into(),
+                status: StepStatus::Completed,
+                result: Some("ok".into()),
+                attempts: 1,
+            }],
+            context: String::new(),
+            last_error: None,
+        };
+        let prompt = GoalEngine::build_reflection_prompt(&goal);
+        assert!(!prompt.contains("Accumulated context"));
+    }
+
+    #[test]
+    fn build_reflection_prompt_no_last_error_omits_section() {
+        let goal = Goal {
+            id: "g1".into(),
+            description: "No error".into(),
+            status: GoalStatus::InProgress,
+            priority: GoalPriority::High,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![Step {
+                id: "s1".into(),
+                description: "Step".into(),
+                status: StepStatus::Completed,
+                result: Some("ok".into()),
+                attempts: 1,
+            }],
+            context: "some ctx".into(),
+            last_error: None,
+        };
+        let prompt = GoalEngine::build_reflection_prompt(&goal);
+        assert!(!prompt.contains("Last error"));
+    }
+
+    #[test]
+    fn build_reflection_prompt_all_done_tags() {
+        let goal = Goal {
+            id: "g1".into(),
+            description: "All done".into(),
+            status: GoalStatus::InProgress,
+            priority: GoalPriority::High,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![
+                Step {
+                    id: "s1".into(),
+                    description: "First".into(),
+                    status: StepStatus::Completed,
+                    result: Some("ok".into()),
+                    attempts: 1,
+                },
+                Step {
+                    id: "s2".into(),
+                    description: "Second".into(),
+                    status: StepStatus::Completed,
+                    result: Some("ok".into()),
+                    attempts: 1,
+                },
+            ],
+            context: String::new(),
+            last_error: None,
+        };
+        let prompt = GoalEngine::build_reflection_prompt(&goal);
+        assert!(prompt.contains("[done] First"));
+        assert!(prompt.contains("[done] Second"));
+        assert!(!prompt.contains("[exhausted]"));
+        assert!(!prompt.contains("[blocked]"));
+    }
+
+    // ── GoalPriority comparison and serde ────────────────────────
+
+    #[test]
+    fn priority_all_comparisons() {
+        assert!(GoalPriority::Critical > GoalPriority::High);
+        assert!(GoalPriority::High > GoalPriority::Medium);
+        assert!(GoalPriority::Medium > GoalPriority::Low);
+        assert!(GoalPriority::Low < GoalPriority::Critical);
+    }
+
+    #[test]
+    fn priority_serde_roundtrip_all_variants() {
+        for priority in &[
+            GoalPriority::Low,
+            GoalPriority::Medium,
+            GoalPriority::High,
+            GoalPriority::Critical,
+        ] {
+            let json = serde_json::to_string(priority).unwrap();
+            let parsed: GoalPriority = serde_json::from_str(&json).unwrap();
+            assert_eq!(*priority, parsed);
+        }
+    }
 }

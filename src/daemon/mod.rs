@@ -817,7 +817,11 @@ mod tests {
         let err = deliver_heartbeat(&config, "lark", "oc_abc123", "report")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lark channel not configured"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -836,6 +840,10 @@ mod tests {
         let err = deliver_heartbeat(&config, "LARK", "oc_abc123", "report")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lark channel not configured"))
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -2617,6 +2617,8 @@ mod tests {
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2638,6 +2640,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -2690,6 +2694,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 20,
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -2968,7 +2974,7 @@ mod tests {
         );
 
         let mut ch_intl = make_channel();
-        ch_intl.use_feishu = false;
+        ch_intl.platform = LarkPlatform::Lark;
         assert_eq!(
             ch_intl.edit_message_url("om_draft_123"),
             "https://open.larksuite.com/open-apis/im/v1/messages/om_draft_123"
@@ -3092,5 +3098,120 @@ mod tests {
     fn table_row_parsing() {
         let cells = parse_table_row("| Component | Status | Note |");
         assert_eq!(cells, vec!["Component", "Status", "Note"]);
+    }
+
+    // ── lark_receive_id_type tests ──────────────────────────────
+
+    #[test]
+    fn lark_receive_id_type_open_id_prefix() {
+        assert_eq!(lark_receive_id_type("ou_abc123def"), "open_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_union_id_prefix() {
+        assert_eq!(lark_receive_id_type("on_abc123def"), "union_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_chat_id_prefix() {
+        assert_eq!(lark_receive_id_type("oc_abc123def"), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_empty_defaults_to_chat_id() {
+        assert_eq!(lark_receive_id_type(""), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_random_defaults_to_chat_id() {
+        assert_eq!(lark_receive_id_type("hello_world"), "chat_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_bare_prefix_still_matches() {
+        assert_eq!(lark_receive_id_type("ou_"), "open_id");
+        assert_eq!(lark_receive_id_type("on_"), "union_id");
+    }
+
+    #[test]
+    fn lark_receive_id_type_uppercase_prefix_no_match() {
+        assert_eq!(lark_receive_id_type("OU_abc123"), "chat_id");
+        assert_eq!(lark_receive_id_type("ON_abc123"), "chat_id");
+    }
+
+    // ── strip_tool_blocks tests ─────────────────────────────────
+
+    #[test]
+    fn strip_tool_blocks_removes_tool_call() {
+        let input = "hello <tool_call>some call</tool_call> world";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_call"));
+        assert!(!result.contains("some call"));
+    }
+
+    #[test]
+    fn strip_tool_blocks_empty_input() {
+        assert_eq!(strip_tool_blocks(""), "");
+    }
+
+    #[test]
+    fn strip_tool_blocks_multiple_blocks() {
+        let input = "a <tool_code>x</tool_code> b <tool_call>y</tool_call> c";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_code"));
+        assert!(!result.contains("tool_call"));
+        assert!(result.contains('a'));
+        assert!(result.contains('b'));
+        assert!(result.contains('c'));
+    }
+
+    #[test]
+    fn strip_tool_blocks_multiline() {
+        let input = "before\n<tool_code>\nline1\nline2\n</tool_code>\nafter";
+        let result = strip_tool_blocks(input);
+        assert!(!result.contains("tool_code"));
+        assert!(!result.contains("line1"));
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+    }
+
+    // ── Emoji/reaction constant validation ──────────────────────
+
+    #[test]
+    fn lark_ack_reactions_arrays_non_empty() {
+        assert!(!LARK_ACK_REACTIONS_ZH_CN.is_empty());
+        assert!(!LARK_ACK_REACTIONS_ZH_TW.is_empty());
+        assert!(!LARK_ACK_REACTIONS_EN.is_empty());
+        assert!(!LARK_ACK_REACTIONS_JA.is_empty());
+    }
+
+    #[test]
+    fn lark_ack_reactions_no_duplicates() {
+        for (name, arr) in &[
+            ("ZH_CN", LARK_ACK_REACTIONS_ZH_CN),
+            ("ZH_TW", LARK_ACK_REACTIONS_ZH_TW),
+            ("EN", LARK_ACK_REACTIONS_EN),
+            ("JA", LARK_ACK_REACTIONS_JA),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for key in *arr {
+                assert!(seen.insert(*key), "Duplicate '{key}' in {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn lark_ack_reactions_all_uppercase() {
+        for (name, arr) in &[
+            ("ZH_CN", LARK_ACK_REACTIONS_ZH_CN),
+            ("ZH_TW", LARK_ACK_REACTIONS_ZH_TW),
+            ("EN", LARK_ACK_REACTIONS_EN),
+            ("JA", LARK_ACK_REACTIONS_JA),
+        ] {
+            for key in *arr {
+                assert!(!key.is_empty(), "Empty key in {name}");
+                assert_eq!(*key, key.to_uppercase(), "'{key}' in {name} not UPPERCASE");
+            }
+        }
     }
 }

@@ -574,4 +574,179 @@ mod tests {
         }
         Ok(())
     }
+
+    // ── log_tool_call session source propagation ────────────────
+
+    #[test]
+    fn log_tool_call_propagates_various_session_sources() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        let sources = &["cli", "daemon", "heartbeat", "goal-loop", "cron:health-check"];
+        for source in sources {
+            logger.log_tool_call(source, "file_read", true, 10, None)?;
+        }
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let events: Vec<AuditEvent> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse audit line"))
+            .collect();
+
+        assert_eq!(events.len(), sources.len());
+        for (event, expected_source) in events.iter().zip(sources.iter()) {
+            let actor = event.actor.as_ref().expect("actor must be set");
+            assert_eq!(actor.channel, *expected_source);
+        }
+        Ok(())
+    }
+
+    // ── AuditEvent full builder chain ───────────────────────────
+
+    #[test]
+    fn audit_event_full_builder_chain_sets_all_fields() {
+        let event = AuditEvent::new(AuditEventType::ToolCallAudit)
+            .with_actor(
+                "telegram".to_string(),
+                Some("u123".to_string()),
+                Some("zeroclaw_user".to_string()),
+            )
+            .with_action("shell".to_string(), "medium".to_string(), true, true)
+            .with_result(true, Some(0), 42, None)
+            .with_security(Some("landlock".to_string()));
+
+        let actor = event.actor.as_ref().unwrap();
+        assert_eq!(actor.channel, "telegram");
+        assert_eq!(actor.user_id, Some("u123".to_string()));
+        assert_eq!(actor.username, Some("zeroclaw_user".to_string()));
+
+        let action = event.action.as_ref().unwrap();
+        assert_eq!(action.command, Some("shell".to_string()));
+        assert_eq!(action.risk_level, Some("medium".to_string()));
+        assert!(action.approved);
+        assert!(action.allowed);
+
+        let result = event.result.as_ref().unwrap();
+        assert!(result.success);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.duration_ms, Some(42));
+        assert!(result.error.is_none());
+
+        assert_eq!(
+            event.security.sandbox_backend,
+            Some("landlock".to_string())
+        );
+    }
+
+    #[test]
+    fn audit_event_default_security_context() {
+        let event = AuditEvent::new(AuditEventType::CommandExecution);
+        assert!(!event.security.policy_violation);
+        assert!(event.security.rate_limit_remaining.is_none());
+        assert!(event.security.sandbox_backend.is_none());
+    }
+
+    // ── log_command backward compat ─────────────────────────────
+
+    #[test]
+    fn log_command_backward_compat_produces_command_execution_type() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_command("telegram", "echo ok", "low", false, true, true, 15)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        match parsed.event_type {
+            AuditEventType::CommandExecution => {}
+            other => panic!("expected CommandExecution, got {:?}", other),
+        }
+        let actor = parsed.actor.unwrap();
+        assert_eq!(actor.channel, "telegram");
+        Ok(())
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn log_tool_call_with_none_error() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_tool_call("cli", "file_read", true, 5, None)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        assert!(parsed.result.unwrap().error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn log_tool_call_with_empty_error_string() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_tool_call("cli", "shell", false, 10, Some(""))?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        assert_eq!(parsed.result.unwrap().error, Some(String::new()));
+        Ok(())
+    }
+
+    // ── Multiple events in one file ─────────────────────────────
+
+    #[test]
+    fn multiple_events_are_separate_json_lines() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_tool_call("cli", "file_read", true, 10, None)?;
+        logger.log_tool_call("daemon", "shell", false, 20, Some("denied"))?;
+        logger.log_tool_call("heartbeat", "memory_recall", true, 30, None)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "expected 3 JSON lines");
+
+        let events: Vec<AuditEvent> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(events[0].actor.as_ref().unwrap().channel, "cli");
+        assert_eq!(events[1].actor.as_ref().unwrap().channel, "daemon");
+        assert_eq!(events[2].actor.as_ref().unwrap().channel, "heartbeat");
+        Ok(())
+    }
 }
