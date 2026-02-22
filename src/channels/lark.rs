@@ -1234,6 +1234,10 @@ impl Channel for LarkChannel {
         }
 
         let cleaned = strip_tool_blocks(text);
+        if cleaned.is_empty() {
+            tracing::debug!("Lark update_draft: skipping edit for {message_id} (content empty after stripping tool blocks)");
+            return Ok(None);
+        }
         let post = markdown_to_lark_post(&cleaned);
         let content = post.to_string();
 
@@ -1271,6 +1275,10 @@ impl Channel for LarkChannel {
         self.draft_edit_counts.lock().remove(message_id);
 
         let cleaned = strip_tool_blocks(text);
+        if cleaned.is_empty() {
+            tracing::debug!("Lark finalize_draft: content empty after stripping tool blocks for {message_id}; skipping edit");
+            return Ok(());
+        }
         let post = markdown_to_lark_post(&cleaned);
         let content = post.to_string();
 

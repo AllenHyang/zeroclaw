@@ -1883,7 +1883,15 @@ async fn process_channel_message(
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id_arc) = draft_message_id {
                     let draft_id = draft_id_arc.lock().await.clone();
-                    if let Err(e) = channel
+                    if delivered_response.trim().is_empty() {
+                        // Nothing to show — remove the placeholder draft
+                        if let Err(err) = channel.cancel_draft(&msg.reply_target, &draft_id).await {
+                            tracing::debug!(
+                                "Failed to cancel empty draft on {}: {err}",
+                                channel.name()
+                            );
+                        }
+                    } else if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, &draft_id, &delivered_response)
                         .await
                     {

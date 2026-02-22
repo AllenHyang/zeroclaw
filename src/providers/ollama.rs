@@ -514,11 +514,11 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    &crate::util::truncate_with_ellipsis(thinking, 100)
                 );
                 return Ok(format!(
                     "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                    &crate::util::truncate_with_ellipsis(thinking, 200)
                 ));
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -565,12 +565,12 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    &crate::util::truncate_with_ellipsis(thinking, 100)
                 );
                 // Return a message indicating the model's thought process but no action
                 return Ok(format!(
                     "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                    if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                    &crate::util::truncate_with_ellipsis(thinking, 200)
                 ));
             }
             tracing::warn!("Ollama returned empty content with no tool calls");
@@ -651,12 +651,12 @@ impl Provider for OllamaProvider {
             if let Some(thinking) = &response.message.thinking {
                 tracing::warn!(
                     "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
-                    if thinking.len() > 100 { &thinking[..100] } else { thinking }
+                    &crate::util::truncate_with_ellipsis(thinking, 100)
                 );
                 return Ok(ChatResponse {
                     text: Some(format!(
                         "I was thinking about this: {}... but I didn't complete my response. Could you try asking again?",
-                        if thinking.len() > 200 { &thinking[..200] } else { thinking }
+                        &crate::util::truncate_with_ellipsis(thinking, 200)
                     )),
                     tool_calls: vec![],
                     usage,
