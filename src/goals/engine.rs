@@ -329,6 +329,7 @@ impl GoalEngine {
 
         prompt
     }
+
 }
 
 #[cfg(test)]
