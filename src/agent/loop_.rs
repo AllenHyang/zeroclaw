@@ -2877,6 +2877,7 @@ pub async fn run(
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
+    enable_state_reconciliation: bool,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3182,6 +3183,11 @@ pub async fn run(
         ];
 
         let channel_name = if interactive { "cli" } else { "daemon" };
+        let reconciliation_dir = if enable_state_reconciliation {
+            Some(config.workspace_dir.as_path())
+        } else {
+            None
+        };
         let response = run_tool_call_loop(
             provider.as_ref(),
             &mut history,
@@ -3199,7 +3205,7 @@ pub async fn run(
             None,
             None,
             &[],
-            Some(&config.workspace_dir),
+            reconciliation_dir,
             audit_logger.as_ref(),
         )
         .await?;
@@ -3305,6 +3311,11 @@ pub async fn run(
 
             history.push(ChatMessage::user(&enriched));
 
+            let reconciliation_dir = if enable_state_reconciliation {
+                Some(config.workspace_dir.as_path())
+            } else {
+                None
+            };
             let response = match run_tool_call_loop(
                 provider.as_ref(),
                 &mut history,
@@ -3322,7 +3333,7 @@ pub async fn run(
                 None,
                 None,
                 &[],
-                Some(&config.workspace_dir),
+                reconciliation_dir,
                 audit_logger.as_ref(),
             )
             .await
