@@ -2333,6 +2333,28 @@ pub struct GoalLoopConfig {
     /// Optional recipient/chat_id for goal event delivery.
     #[serde(default)]
     pub target: Option<String>,
+
+    /// Enable idle exploration: when no goals are active, periodically
+    /// call the agent to review context and propose new goals.
+    /// Default: `false`.
+    #[serde(default)]
+    pub explore_when_idle: bool,
+
+    /// Minimum minutes between exploration runs. Default: `60`.
+    #[serde(default = "default_explore_cooldown_minutes")]
+    pub explore_cooldown_minutes: u32,
+
+    /// Maximum exploration runs per calendar day (UTC). Default: `6`.
+    #[serde(default = "default_max_explorations_per_day")]
+    pub max_explorations_per_day: u32,
+}
+
+fn default_explore_cooldown_minutes() -> u32 {
+    60
+}
+
+fn default_max_explorations_per_day() -> u32 {
+    6
 }
 
 impl Default for GoalLoopConfig {
@@ -2344,6 +2366,9 @@ impl Default for GoalLoopConfig {
             max_steps_per_cycle: 3,
             channel: None,
             target: None,
+            explore_when_idle: false,
+            explore_cooldown_minutes: default_explore_cooldown_minutes(),
+            max_explorations_per_day: default_max_explorations_per_day(),
         }
     }
 }
@@ -7275,10 +7300,7 @@ require_otp_to_resume = true
             is_temp_directory(&nested),
             "deeply nested existing child of temp dir should be detected"
         );
-        std::fs::remove_dir_all(
-            std::env::temp_dir().join("zeroclaw_is_temp_test_deep"),
-        )
-        .ok();
+        std::fs::remove_dir_all(std::env::temp_dir().join("zeroclaw_is_temp_test_deep")).ok();
     }
 
     #[test]
@@ -7311,10 +7333,7 @@ require_otp_to_resume = true
     #[test]
     async fn is_temp_directory_rejects_etc_path() {
         let etc = PathBuf::from("/etc/zeroclaw");
-        assert!(
-            !is_temp_directory(&etc),
-            "/etc path should not be temp"
-        );
+        assert!(!is_temp_directory(&etc), "/etc path should not be temp");
     }
 
     #[test]

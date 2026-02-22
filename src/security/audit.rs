@@ -587,7 +587,13 @@ mod tests {
         };
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
 
-        let sources = &["cli", "daemon", "heartbeat", "goal-loop", "cron:health-check"];
+        let sources = &[
+            "cli",
+            "daemon",
+            "heartbeat",
+            "goal-loop",
+            "cron:health-check",
+        ];
         for source in sources {
             logger.log_tool_call(source, "file_read", true, 10, None)?;
         }
@@ -638,10 +644,7 @@ mod tests {
         assert_eq!(result.duration_ms, Some(42));
         assert!(result.error.is_none());
 
-        assert_eq!(
-            event.security.sandbox_backend,
-            Some("landlock".to_string())
-        );
+        assert_eq!(event.security.sandbox_backend, Some("landlock".to_string()));
     }
 
     #[test]

@@ -446,6 +446,56 @@ async fn deliver_heartbeat(
 
 // ── Goal Loop Worker ─────────────────────────────────────────────
 
+/// Returns `true` if the state has goals that the loop can act on
+/// (either steps to execute or stalled goals to reflect on).
+fn has_actionable_goals(state: &crate::goals::engine::GoalState) -> bool {
+    use crate::goals::engine::GoalEngine;
+    GoalEngine::select_next_actionable(state).is_some()
+        || !GoalEngine::find_stalled_goals(state).is_empty()
+}
+
+/// Lightweight network reachability check (TCP connect with 5s timeout).
+/// Returns `true` if the provider endpoint is reachable.
+async fn check_network_reachable(config: &Config) -> bool {
+    let host = if let Some(ref provider) = config.default_provider {
+        // Extract host from provider string like "anthropic-custom:https://open.bigmodel.cn/api/..."
+        if let Some(url_part) = provider.split("https://").nth(1) {
+            url_part.split('/').next().unwrap_or("").to_string()
+        } else if let Some(url_part) = provider.split("http://").nth(1) {
+            url_part.split('/').next().unwrap_or("").to_string()
+        } else {
+            // Known provider names → use their default hosts
+            match provider.as_str() {
+                "anthropic" => "api.anthropic.com".to_string(),
+                "openai" => "api.openai.com".to_string(),
+                p if p.starts_with("google") || p.starts_with("gemini") => {
+                    "generativelanguage.googleapis.com".to_string()
+                }
+                _ => return true, // Unknown provider, skip check
+            }
+        }
+    } else {
+        return true; // No provider configured, skip check
+    };
+
+    if host.is_empty() {
+        return true;
+    }
+
+    let addr = if host.contains(':') {
+        host
+    } else {
+        format!("{host}:443")
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
+}
+
 async fn run_goal_loop_worker(config: Config) -> Result<()> {
     use crate::goals::engine::{GoalEngine, GoalStatus, StepStatus};
 
@@ -455,6 +505,11 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
     let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
 
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+
+    // Idle exploration state
+    let mut last_exploration: Option<tokio::time::Instant> = None;
+    let mut daily_exploration_count: u32 = 0;
+    let mut last_exploration_date: Option<chrono::NaiveDate> = None;
 
     loop {
         interval.tick().await;
@@ -467,7 +522,86 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             }
         };
 
-        if state.goals.is_empty() {
+        // ── Idle exploration: no actionable goals ────────────────────
+        if state.goals.is_empty() || !has_actionable_goals(&state) {
+            if !config.goal_loop.explore_when_idle {
+                continue;
+            }
+
+            // Reset daily counter on date change
+            let today = chrono::Utc::now().date_naive();
+            if last_exploration_date != Some(today) {
+                daily_exploration_count = 0;
+                last_exploration_date = Some(today);
+            }
+
+            // Check daily cap
+            if daily_exploration_count >= config.goal_loop.max_explorations_per_day {
+                tracing::debug!("Idle exploration: daily cap reached ({daily_exploration_count})");
+                continue;
+            }
+
+            // Check cooldown
+            let cooldown = Duration::from_secs(
+                u64::from(config.goal_loop.explore_cooldown_minutes.max(1)) * 60,
+            );
+            if let Some(last) = last_exploration {
+                if last.elapsed() < cooldown {
+                    continue;
+                }
+            }
+
+            // Network pre-check: skip if offline
+            if !check_network_reachable(&config).await {
+                tracing::debug!("Idle exploration: network unreachable, skipping");
+                continue;
+            }
+
+            // Run exploration
+            tracing::info!("Goal loop: no active goals, triggering idle exploration");
+            let prompt = GoalEngine::build_exploration_prompt(&state);
+            let temp = config.default_temperature;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                    false,
+                    Some("idle-exploration"),
+                ),
+            )
+            .await;
+
+            last_exploration = Some(tokio::time::Instant::now());
+            daily_exploration_count += 1;
+
+            match result {
+                Ok(Ok(output)) => {
+                    tracing::info!("Idle exploration completed");
+                    crate::health::mark_component_ok("goal-loop");
+                    notify_goal_event(
+                        &config,
+                        &format!(
+                            "Idle exploration:\n{}",
+                            crate::util::truncate_with_ellipsis(&output, 300),
+                        ),
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Idle exploration failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("Idle exploration timed out");
+                }
+            }
+
             continue;
         }
 
@@ -507,7 +641,9 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                     state = match engine.load_state().await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!("Goal loop: failed to reload state after reflection: {e}");
+                            tracing::warn!(
+                                "Goal loop: failed to reload state after reflection: {e}"
+                            );
                             break;
                         }
                     };
@@ -515,7 +651,11 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                         &config,
                         &format!(
                             "Goal reflection: {}\n{}",
-                            state.goals.get(gi).map(|g| g.description.as_str()).unwrap_or("?"),
+                            state
+                                .goals
+                                .get(gi)
+                                .map(|g| g.description.as_str())
+                                .unwrap_or("?"),
                             crate::util::truncate_with_ellipsis(&output, 300),
                         ),
                     )

@@ -260,6 +260,87 @@ impl GoalEngine {
         MAX_STEP_ATTEMPTS
     }
 
+    /// Build an exploration prompt for when no goals are active.
+    ///
+    /// The agent is asked to review context, check for unfinished threads,
+    /// and optionally propose new goals with verified preconditions.
+    pub fn build_exploration_prompt(state: &GoalState) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str(
+            "[Idle Exploration] No active goals. Review context and consider proposing new work.\n\n",
+        );
+
+        Self::append_goals_by_status(&mut prompt, state);
+
+        prompt.push_str(
+            "Instructions:\n\
+             1. Use memory_recall to review recent consolidation entries and daily activity\n\
+             2. Consider the user's mission areas (from SOUL.md if available)\n\
+             3. Check for unfinished threads: blocked goals that might be unblockable now,\n\
+             \x20  pending goals that need updates, or follow-ups to completed goals\n\
+             4. If you identify a valuable new direction:\n\
+             \x20  a. VERIFY the precondition first (e.g., check if data exists before proposing\n\
+             \x20     to process it, check if a service is reachable before proposing to use it)\n\
+             \x20  b. Only if preconditions hold: write a new goal to state/goals.json with\n\
+             \x20     status \"pending\", priority \"low\", and 3-5 concrete steps\n\
+             \x20  c. Notify the user with a brief rationale\n\
+             5. If nothing valuable surfaces, just say so briefly. Do not force a goal.\n\
+             6. Keep this lightweight — max 5 tool calls.\n",
+        );
+
+        prompt
+    }
+
+    /// Append a summary of goals grouped by status (completed, blocked, pending).
+    fn append_goals_by_status(buf: &mut String, state: &GoalState) {
+        buf.push_str("== Completed goals ==\n");
+        let completed: Vec<&Goal> = state
+            .goals
+            .iter()
+            .filter(|g| g.status == GoalStatus::Completed)
+            .collect();
+        if completed.is_empty() {
+            buf.push_str("(none)\n");
+        } else {
+            for g in &completed {
+                let _ = writeln!(buf, "- {}", g.description);
+            }
+        }
+        buf.push('\n');
+
+        buf.push_str("== Blocked goals ==\n");
+        let blocked: Vec<&Goal> = state
+            .goals
+            .iter()
+            .filter(|g| g.status == GoalStatus::Blocked)
+            .collect();
+        if blocked.is_empty() {
+            buf.push_str("(none)\n");
+        } else {
+            for g in &blocked {
+                let err = g.last_error.as_deref().unwrap_or("(no error recorded)");
+                let _ = writeln!(buf, "- {} [error: {}]", g.description, err);
+            }
+        }
+        buf.push('\n');
+
+        buf.push_str("== Pending goals (awaiting approval) ==\n");
+        let pending: Vec<&Goal> = state
+            .goals
+            .iter()
+            .filter(|g| g.status == GoalStatus::Pending)
+            .collect();
+        if pending.is_empty() {
+            buf.push_str("(none)\n");
+        } else {
+            for g in &pending {
+                let _ = writeln!(buf, "- {}", g.description);
+            }
+        }
+        buf.push('\n');
+    }
+
     /// Find in-progress goals that have no actionable steps remaining.
     ///
     /// A goal is "stalled" when it is `InProgress` but every step is either
@@ -274,9 +355,10 @@ impl GoalEngine {
             .filter(|(_, g)| g.status == GoalStatus::InProgress)
             .filter(|(_, g)| {
                 !g.steps.is_empty()
-                    && !g.steps.iter().any(|s| {
-                        s.status == StepStatus::Pending && s.attempts < MAX_STEP_ATTEMPTS
-                    })
+                    && !g
+                        .steps
+                        .iter()
+                        .any(|s| s.status == StepStatus::Pending && s.attempts < MAX_STEP_ATTEMPTS)
             })
             .map(|(i, _)| i)
             .collect()
@@ -289,11 +371,7 @@ impl GoalEngine {
     pub fn build_reflection_prompt(goal: &Goal) -> String {
         let mut prompt = String::new();
 
-        let _ = writeln!(
-            prompt,
-            "[Goal Reflection] Goal: {}\n",
-            goal.description
-        );
+        let _ = writeln!(prompt, "[Goal Reflection] Goal: {}\n", goal.description);
 
         prompt.push_str("All steps have been attempted. Here is the current state:\n\n");
 
@@ -329,7 +407,6 @@ impl GoalEngine {
 
         prompt
     }
-
 }
 
 #[cfg(test)]
@@ -670,7 +747,13 @@ target = "oc_test"
 
     #[test]
     fn goal_status_self_healing_unknown_variants() {
-        for variant in &["\"unknown\"", "\"invalid\"", "\"PENDING\"", "\"IN_PROGRESS\"", "\"\""] {
+        for variant in &[
+            "\"unknown\"",
+            "\"invalid\"",
+            "\"PENDING\"",
+            "\"IN_PROGRESS\"",
+            "\"\"",
+        ] {
             let parsed: GoalStatus =
                 serde_json::from_str(variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
             assert_eq!(parsed, GoalStatus::Pending);
@@ -925,5 +1008,139 @@ target = "oc_test"
             let parsed: GoalPriority = serde_json::from_str(&json).unwrap();
             assert_eq!(*priority, parsed);
         }
+    }
+
+    // ── build_exploration_prompt tests ───────────────────────────
+
+    #[test]
+    fn exploration_prompt_empty_state() {
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(prompt.contains("[Idle Exploration]"));
+        assert!(prompt.contains("== Completed goals ==\n(none)"));
+        assert!(prompt.contains("== Blocked goals ==\n(none)"));
+        assert!(prompt.contains("== Pending goals (awaiting approval) ==\n(none)"));
+        assert!(prompt.contains("memory_recall"));
+        assert!(prompt.contains("VERIFY the precondition"));
+    }
+
+    #[test]
+    fn exploration_prompt_mixed_state() {
+        let state = GoalState {
+            goals: vec![
+                Goal {
+                    id: "g1".into(),
+                    description: "Completed task".into(),
+                    status: GoalStatus::Completed,
+                    priority: GoalPriority::High,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    steps: vec![],
+                    context: String::new(),
+                    last_error: None,
+                },
+                Goal {
+                    id: "g2".into(),
+                    description: "Blocked task".into(),
+                    status: GoalStatus::Blocked,
+                    priority: GoalPriority::Medium,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    steps: vec![],
+                    context: String::new(),
+                    last_error: Some("network timeout".into()),
+                },
+                Goal {
+                    id: "g3".into(),
+                    description: "Pending task".into(),
+                    status: GoalStatus::Pending,
+                    priority: GoalPriority::Low,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    steps: vec![],
+                    context: String::new(),
+                    last_error: None,
+                },
+            ],
+        };
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(prompt.contains("- Completed task"));
+        assert!(prompt.contains("- Blocked task [error: network timeout]"));
+        assert!(prompt.contains("- Pending task"));
+    }
+
+    #[test]
+    fn exploration_prompt_blocked_goals_include_last_error() {
+        let state = GoalState {
+            goals: vec![
+                Goal {
+                    id: "g1".into(),
+                    description: "Blocked with error".into(),
+                    status: GoalStatus::Blocked,
+                    priority: GoalPriority::High,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    steps: vec![],
+                    context: String::new(),
+                    last_error: Some("API rate limit".into()),
+                },
+                Goal {
+                    id: "g2".into(),
+                    description: "Blocked no error".into(),
+                    status: GoalStatus::Blocked,
+                    priority: GoalPriority::Low,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    steps: vec![],
+                    context: String::new(),
+                    last_error: None,
+                },
+            ],
+        };
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(prompt.contains("[error: API rate limit]"));
+        assert!(prompt.contains("[error: (no error recorded)]"));
+    }
+
+    // ── GoalLoopConfig idle exploration serde tests ──────────────
+
+    #[test]
+    fn goal_loop_config_explore_fields_serde() {
+        let toml_str = r#"
+enabled = true
+interval_minutes = 15
+step_timeout_secs = 180
+max_steps_per_cycle = 5
+explore_when_idle = true
+explore_cooldown_minutes = 30
+max_explorations_per_day = 4
+"#;
+        let config: crate::config::GoalLoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.explore_when_idle);
+        assert_eq!(config.explore_cooldown_minutes, 30);
+        assert_eq!(config.max_explorations_per_day, 4);
+    }
+
+    #[test]
+    fn goal_loop_config_explore_defaults() {
+        let config = crate::config::GoalLoopConfig::default();
+        assert!(!config.explore_when_idle);
+        assert_eq!(config.explore_cooldown_minutes, 60);
+        assert_eq!(config.max_explorations_per_day, 6);
+    }
+
+    #[test]
+    fn goal_loop_config_backward_compat_no_explore_fields() {
+        let toml_str = r#"
+enabled = true
+interval_minutes = 10
+step_timeout_secs = 120
+max_steps_per_cycle = 3
+"#;
+        let config: crate::config::GoalLoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!(!config.explore_when_idle);
+        assert_eq!(config.explore_cooldown_minutes, 60);
+        assert_eq!(config.max_explorations_per_day, 6);
     }
 }
