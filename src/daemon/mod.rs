@@ -95,6 +95,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
 
     if config.cron.enabled {
+        // Ensure nightly consolidation job exists (idempotent).
+        ensure_consolidation_job(&config);
+
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -570,6 +573,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             let prompt = GoalEngine::build_exploration_prompt(&state);
             let temp = config.default_temperature;
 
+            let started_at = chrono::Utc::now();
             let result = tokio::time::timeout(
                 step_timeout,
                 crate::agent::run(
@@ -585,6 +589,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 ),
             )
             .await;
+            let finished_at = chrono::Utc::now();
 
             last_exploration = Some(tokio::time::Instant::now());
             daily_exploration_count += 1;
@@ -594,6 +599,18 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 Ok(Ok(output)) => {
                     tracing::info!("Idle exploration completed");
                     crate::health::mark_component_ok("goal-loop");
+                    // Persist exploration output so consolidation can see it
+                    // via `cron_runs`. Uses a synthetic job_id.
+                    let duration_ms = (finished_at - started_at).num_milliseconds();
+                    let _ = crate::cron::record_run(
+                        &config,
+                        "__idle_exploration",
+                        started_at,
+                        finished_at,
+                        "ok",
+                        Some(&output),
+                        duration_ms,
+                    );
                     notify_goal_event(
                         &config,
                         &format!(
@@ -604,9 +621,29 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                     .await;
                 }
                 Ok(Err(e)) => {
+                    let duration_ms = (finished_at - started_at).num_milliseconds();
+                    let _ = crate::cron::record_run(
+                        &config,
+                        "__idle_exploration",
+                        started_at,
+                        finished_at,
+                        "error",
+                        Some(&e.to_string()),
+                        duration_ms,
+                    );
                     tracing::warn!("Idle exploration failed: {e}");
                 }
                 Err(_) => {
+                    let duration_ms = (finished_at - started_at).num_milliseconds();
+                    let _ = crate::cron::record_run(
+                        &config,
+                        "__idle_exploration",
+                        started_at,
+                        finished_at,
+                        "timeout",
+                        None,
+                        duration_ms,
+                    );
                     tracing::warn!("Idle exploration timed out");
                 }
             }
@@ -834,6 +871,40 @@ fn has_supervised_channels(config: &Config) -> bool {
         .channels_except_webhook()
         .iter()
         .any(|(_, ok)| *ok)
+}
+
+/// Ensure the nightly consolidation job exists in the cron store.
+/// Called once on daemon startup when cron is enabled.  If the job
+/// already exists this is a no-op.
+fn ensure_consolidation_job(config: &Config) {
+    use crate::cron::consolidation::CONSOLIDATION_JOB_NAME;
+
+    match crate::cron::list_jobs(config) {
+        Ok(jobs) => {
+            if jobs
+                .iter()
+                .any(|j| j.name.as_deref() == Some(CONSOLIDATION_JOB_NAME))
+            {
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check for consolidation job: {e}");
+            return;
+        }
+    }
+
+    match crate::cron::consolidation::create_consolidation_job(config) {
+        Ok(job) => {
+            tracing::info!(
+                job_id = %job.id,
+                "Auto-registered nightly consolidation job"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create nightly consolidation job: {e}");
+        }
+    }
 }
 
 #[cfg(test)]

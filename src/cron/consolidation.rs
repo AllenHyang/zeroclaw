@@ -18,24 +18,31 @@ stored in long-term memory.
 Follow these steps exactly:
 
 1. Use `cron_runs` to review recent job execution results from the past 24 hours. \
-   Note any recurring errors, timeouts, or policy denials.
+   Note any recurring errors, timeouts, or policy denials. Pay special attention \
+   to `__idle_exploration` runs — these contain autonomous exploration results.
 
 2. Use `memory_recall` to retrieve today's Daily memories. Look for patterns, \
    discoveries, and progress toward goals.
 
-3. Identify and classify findings:
+3. Use `memory_recall` with query \"exploration journal\" to retrieve today's \
+   exploration journal entries (category: exploration). These contain autonomous \
+   discoveries, self-critiques, and suggested next directions from idle exploration.
+
+4. Identify and classify findings from ALL sources (cron runs, daily memories, \
+   AND exploration journals):
    - **Recurring errors**: problems that appeared more than once
    - **Successful strategies**: approaches that worked well
    - **New discoveries**: information or capabilities learned
    - **Blocked goals**: objectives that could not be completed and why
+   - **Exploration insights**: valuable findings from idle exploration
 
-4. Synthesize a concise summary (max 500 words) of actionable learnings. \
+5. Synthesize a concise summary (max 500 words) of actionable learnings. \
    Focus on what should change going forward, not just what happened.
 
-5. Store the summary using `memory_store` with category \"core\" and \
+6. Store the summary using `memory_store` with category \"core\" and \
    key format \"consolidation_YYYY-MM-DD\" (use today's date).
 
-6. If the workspace file `MEMORY.md` exists, use `file_read` to read it, \
+7. If the workspace file `MEMORY.md` exists, use `file_read` to read it, \
    then use `file_write` to append a dated section at the end with the \
    top 3 learnings from today's consolidation. Format:
    ```
@@ -45,8 +52,9 @@ Follow these steps exactly:
    3. <learning 3>
    ```
 
-If there is no meaningful activity to consolidate (no runs, no daily memories), \
-store a brief note confirming the check was performed and skip the MEMORY.md update.";
+If there is no meaningful activity to consolidate (no runs, no daily memories, \
+no exploration journals), store a brief note confirming the check was performed \
+and skip the MEMORY.md update.";
 
 /// Create a nightly memory consolidation cron agent job.
 ///
@@ -157,6 +165,14 @@ mod tests {
         assert!(
             prompt.contains("MEMORY.md"),
             "prompt should mention MEMORY.md"
+        );
+        assert!(
+            prompt.contains("exploration journal"),
+            "prompt should cross-read exploration journals"
+        );
+        assert!(
+            prompt.contains("__idle_exploration"),
+            "prompt should reference idle exploration runs"
         );
     }
 

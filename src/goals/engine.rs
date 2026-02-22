@@ -277,30 +277,34 @@ impl GoalEngine {
             "Instructions:\n\n\
              == Phase 1: Recall and Reflect ==\n\
              1. Use memory_recall with query \"exploration journal\" to retrieve your past\n\
-             \x20  exploration entries. Review what you explored before, what you found,\n\
-             \x20  and what directions you suggested for next time.\n\
-             2. Use memory_recall to review recent daily activity and consolidation entries.\n\
-             3. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
-             4. REFLECT on your exploration history:\n\
+             \x20  exploration entries (category: exploration). Review what you explored\n\
+             \x20  before, what you found, and what directions you suggested for next time.\n\
+             2. Use memory_recall with query \"consolidation\" to retrieve recent nightly\n\
+             \x20  consolidation summaries (category: core). These distill the full day's\n\
+             \x20  activity — cron results, errors, and discoveries you may have missed.\n\
+             3. Use memory_recall to review recent daily activity entries.\n\
+             4. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
+             5. REFLECT on your exploration history AND consolidation learnings:\n\
              \x20  - Am I stuck in a rut, repeating the same topics?\n\
              \x20  - Did my previous explorations produce actionable results, or just noise?\n\
              \x20  - Has the user's situation changed (new conversations, new priorities)?\n\
              \x20  - What blind spots might I have? What am I NOT looking at?\n\n\
              == Phase 2: Explore with Intent ==\n\
-             5. Based on your reflection, choose ONE direction to explore. Prefer:\n\
+             6. Based on your reflection, choose ONE direction to explore. Prefer:\n\
              \x20  - Directions you suggested in your last journal entry\n\
+             \x20  - Consolidation learnings that suggest unfinished threads\n\
              \x20  - Blind spots or areas you haven't covered recently\n\
              \x20  - Follow-ups to completed goals that might have new developments\n\
              \x20  - Unblocking stuck goals with fresh approaches\n\
              \x20  Over: repeating recent topics, or picking whatever is easiest.\n\
-             6. If you identify a valuable new goal:\n\
+             7. If you identify a valuable new goal:\n\
              \x20  a. VERIFY the precondition first (e.g., check if data exists, if a\n\
              \x20     service is reachable, if the user hasn't already addressed it)\n\
              \x20  b. Only if preconditions hold: write it to state/goals.json with\n\
              \x20     status \"pending\", priority \"low\", and 3-5 concrete steps\n\
              \x20  c. Notify the user with a brief rationale\n\n\
              == Phase 3: Journal ==\n\
-             7. ALWAYS end by writing an exploration journal entry using memory_store.\n\
+             8. ALWAYS end by writing an exploration journal entry using memory_store.\n\
              \x20  Use key \"exploration-journal-YYYY-MM-DD-N\" (N = sequence number today).\n\
              \x20  Use category \"exploration\". Include:\n\
              \x20  - What you explored and why\n\
@@ -309,7 +313,7 @@ impl GoalEngine {
              \x20  - 2-3 specific directions for next exploration (not vague, be concrete)\n\
              \x20  - Any shifts in your mental model of the user's priorities\n\n\
              == Constraints ==\n\
-             - Max 8 tool calls total.\n\
+             - Max 10 tool calls total.\n\
              - If nothing valuable surfaces, say so briefly. Do not force a goal.\n\
              - Quality over quantity. One deep insight beats five shallow scans.\n",
         );
