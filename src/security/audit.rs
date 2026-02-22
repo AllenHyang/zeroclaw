@@ -237,9 +237,12 @@ impl AuditLogger {
     /// Log a tool call audit event.
     ///
     /// Records tool name, success/failure, duration, and an optional error label.
+    /// The `channel` parameter identifies the session source (e.g. "cli", "daemon",
+    /// "heartbeat", "goal-loop", "cron:<name>").
     /// Does NOT log raw arguments or output to avoid leaking sensitive data.
     pub fn log_tool_call(
         &self,
+        channel: &str,
         tool_name: &str,
         success: bool,
         duration_ms: u64,
@@ -251,6 +254,7 @@ impl AuditLogger {
         };
 
         let event = AuditEvent::new(AuditEventType::ToolCallAudit)
+            .with_actor(channel.to_string(), None, None)
             .with_action(
                 tool_name.to_string(),
                 risk_level.to_string(),
@@ -480,7 +484,7 @@ mod tests {
         };
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
 
-        logger.log_tool_call("file_read", true, 25, None)?;
+        logger.log_tool_call("cli", "file_read", true, 25, None)?;
 
         let log_path = tmp.path().join("audit.log");
         let content = tokio::fs::read_to_string(&log_path).await?;
@@ -490,6 +494,8 @@ mod tests {
             AuditEventType::ToolCallAudit => {}
             other => panic!("expected ToolCallAudit, got {:?}", other),
         }
+        let actor = parsed.actor.expect("actor must be set");
+        assert_eq!(actor.channel, "cli");
         let action = parsed.action.unwrap();
         assert_eq!(action.command, Some("file_read".to_string()));
         assert_eq!(action.risk_level, Some("low".to_string()));
@@ -507,7 +513,7 @@ mod tests {
         };
         let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
 
-        logger.log_tool_call("shell", false, 100, Some("permission_denied"))?;
+        logger.log_tool_call("daemon", "shell", false, 100, Some("permission_denied"))?;
 
         let log_path = tmp.path().join("audit.log");
         let content = tokio::fs::read_to_string(&log_path).await?;
@@ -539,11 +545,11 @@ mod tests {
 
         // Medium-risk tools
         for tool in &["shell", "file_write", "file_edit"] {
-            logger.log_tool_call(tool, true, 10, None)?;
+            logger.log_tool_call("cli", tool, true, 10, None)?;
         }
         // Low-risk tools
         for tool in &["file_read", "memory_recall", "browser_snapshot"] {
-            logger.log_tool_call(tool, true, 10, None)?;
+            logger.log_tool_call("cli", tool, true, 10, None)?;
         }
 
         let log_path = tmp.path().join("audit.log");

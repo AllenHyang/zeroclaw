@@ -1833,6 +1833,7 @@ async fn execute_one_tool(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1928,6 +1929,7 @@ async fn execute_one_tool(
                 .or(Some("tool_execution_failed"))
         };
         if let Err(e) = audit.log_tool_call(
+            channel_name,
             call_name,
             outcome.success,
             outcome.duration.as_millis() as u64,
@@ -2108,6 +2110,7 @@ async fn execute_tools_parallel(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2119,6 +2122,7 @@ async fn execute_tools_parallel(
                 observer,
                 cancellation_token,
                 audit_logger,
+                channel_name,
             )
         })
         .collect();
@@ -2133,6 +2137,7 @@ async fn execute_tools_sequential(
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     audit_logger: Option<&crate::security::AuditLogger>,
+    channel_name: &str,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2145,6 +2150,7 @@ async fn execute_tools_sequential(
                 observer,
                 cancellation_token,
                 audit_logger,
+                channel_name,
             )
             .await?,
         );
@@ -2689,6 +2695,7 @@ pub(crate) async fn run_tool_call_loop(
                 observer,
                 cancellation_token.as_ref(),
                 audit_logger,
+                channel_name,
             )
             .await?
         } else {
@@ -2698,6 +2705,7 @@ pub(crate) async fn run_tool_call_loop(
                 observer,
                 cancellation_token.as_ref(),
                 audit_logger,
+                channel_name,
             )
             .await?
         };
@@ -2878,6 +2886,7 @@ pub async fn run(
     peripheral_overrides: Vec<String>,
     interactive: bool,
     enable_state_reconciliation: bool,
+    session_source: Option<&str>,
 ) -> Result<String> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
@@ -3146,7 +3155,7 @@ pub async fn run(
     } else {
         None
     };
-    let channel_name = if interactive { "cli" } else { "daemon" };
+    let channel_name = session_source.unwrap_or(if interactive { "cli" } else { "daemon" });
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -3182,7 +3191,6 @@ pub async fn run(
             ChatMessage::user(&enriched),
         ];
 
-        let channel_name = if interactive { "cli" } else { "daemon" };
         let reconciliation_dir = if enable_state_reconciliation {
             Some(config.workspace_dir.as_path())
         } else {

@@ -179,6 +179,8 @@ async fn run_agent_job(
     }
     let prefixed_prompt = build_agent_prompt(job);
     let model_override = job.model.clone();
+    let cron_name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
+    let session_source = format!("cron:{cron_name}");
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -191,6 +193,7 @@ async fn run_agent_job(
                 vec![],
                 false,
                 false,
+                Some(&session_source),
             )
             .await
         }
