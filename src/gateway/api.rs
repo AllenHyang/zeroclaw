@@ -507,6 +507,27 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/goals — current goal-loop state (goals, steps, status)
+pub async fn handle_api_goals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+    match engine.load_state().await {
+        Ok(goal_state) => Json(serde_json::json!({"goals": goal_state.goals})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to load goals: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn mask_sensitive_fields(toml_str: &str) -> String {
