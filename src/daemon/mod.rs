@@ -364,15 +364,20 @@ async fn deliver_heartbeat(
 
     match channel_name.to_ascii_lowercase().as_str() {
         "lark" => {
-            let lk = config
-                .channels_config
-                .lark
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-            let channel = crate::channels::LarkChannel::from_config(lk);
-            channel
-                .send_card(target, "🦀 ZeroClaw 心跳报告", output)
-                .await?;
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = crate::channels::LarkChannel::from_config(lk);
+                channel
+                    .send_card(target, "🦀 ZeroClaw 心跳报告", output)
+                    .await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            anyhow::bail!("lark channel requires the `channel-lark` build feature");
         }
         "telegram" => {
             let tg = config

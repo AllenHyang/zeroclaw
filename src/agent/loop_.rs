@@ -1848,6 +1848,7 @@ async fn execute_one_tool(
             output: reason.clone(),
             success: false,
             error_reason: Some(scrub_credentials(&reason)),
+            error_kind: None,
             duration,
         });
     };
@@ -2514,6 +2515,7 @@ pub(crate) async fn run_tool_call_loop(
                                 output: cancelled,
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
+                                error_kind: None,
                                 duration: Duration::ZERO,
                             },
                         ));
