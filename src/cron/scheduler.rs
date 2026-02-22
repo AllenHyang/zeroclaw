@@ -373,16 +373,18 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
-        "lark" => {
+        "lark" | "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                let lk = config
-                    .channels_config
-                    .lark
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-                let channel = LarkChannel::from_config(lk);
-                channel.send(&SendMessage::new(output, target)).await?;
+                if let Some(fs) = config.channels_config.feishu.as_ref() {
+                    let channel = LarkChannel::from_feishu_config(fs);
+                    channel.send(&SendMessage::new(output, target)).await?;
+                } else if let Some(lk) = config.channels_config.lark.as_ref() {
+                    let channel = LarkChannel::from_config(lk);
+                    channel.send(&SendMessage::new(output, target)).await?;
+                } else {
+                    anyhow::bail!("lark/feishu channel not configured");
+                }
             }
             #[cfg(not(feature = "channel-lark"))]
             anyhow::bail!("lark channel requires the `channel-lark` build feature");
@@ -946,7 +948,24 @@ mod tests {
         let err = deliver_if_configured(&config, &job, "hello")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lark channel not configured"));
+        assert!(err.to_string().contains("lark/feishu channel not configured"));
+    }
+
+    #[tokio::test]
+    async fn deliver_if_configured_feishu_not_configured_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("feishu".into()),
+            to: Some("oc_abc123".into()),
+            best_effort: false,
+        };
+        let err = deliver_if_configured(&config, &job, "hello")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lark/feishu channel not configured"));
     }
 
     #[test]

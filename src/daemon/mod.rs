@@ -365,18 +365,22 @@ async fn deliver_heartbeat(
     use crate::channels::{Channel, SendMessage};
 
     match channel_name.to_ascii_lowercase().as_str() {
-        "lark" => {
+        "lark" | "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                let lk = config
-                    .channels_config
-                    .lark
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-                let channel = crate::channels::LarkChannel::from_config(lk);
-                channel
-                    .send_card(target, "🦀 ZeroClaw 心跳报告", output)
-                    .await?;
+                if let Some(fs) = config.channels_config.feishu.as_ref() {
+                    let channel = crate::channels::LarkChannel::from_feishu_config(fs);
+                    channel
+                        .send_card(target, "🦀 ZeroClaw 心跳报告", output)
+                        .await?;
+                } else if let Some(lk) = config.channels_config.lark.as_ref() {
+                    let channel = crate::channels::LarkChannel::from_config(lk);
+                    channel
+                        .send_card(target, "🦀 ZeroClaw 心跳报告", output)
+                        .await?;
+                } else {
+                    anyhow::bail!("lark/feishu channel not configured");
+                }
             }
             #[cfg(not(feature = "channel-lark"))]
             anyhow::bail!("lark channel requires the `channel-lark` build feature");
@@ -959,7 +963,20 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            msg.contains("lark/feishu channel not configured") || msg.contains("channel-lark"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_heartbeat_feishu_not_configured_returns_error() {
+        let config = Config::default();
+        let err = deliver_heartbeat(&config, "feishu", "oc_abc123", "report")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lark/feishu channel not configured") || msg.contains("channel-lark"),
             "unexpected error: {msg}"
         );
     }
@@ -982,7 +999,7 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("lark channel not configured") || msg.contains("channel-lark"),
+            msg.contains("lark/feishu channel not configured") || msg.contains("channel-lark"),
             "unexpected error: {msg}"
         );
     }
