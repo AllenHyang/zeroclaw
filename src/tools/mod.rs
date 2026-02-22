@@ -86,6 +86,7 @@ pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
+pub use traits::ErrorKind;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_search_tool::WebSearchTool;
@@ -499,6 +500,7 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
+            error_kind: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -513,6 +515,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
+            error_kind: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

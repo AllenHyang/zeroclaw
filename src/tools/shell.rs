@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolResult};
+use super::traits::{ErrorKind, Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -227,6 +227,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -237,6 +238,7 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
+                    error_kind: Some(ErrorKind::PolicyDenied),
                 });
             }
         }
@@ -246,6 +248,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+                error_kind: Some(ErrorKind::PolicyDenied),
             });
         }
 
@@ -254,6 +257,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -278,6 +282,7 @@ impl ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -315,12 +320,18 @@ impl ShellTool {
                     } else {
                         Some(stderr)
                     },
+                    error_kind: if output.status.success() {
+                        None
+                    } else {
+                        Some(ErrorKind::ExecutionFailed)
+                    },
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
+                error_kind: Some(ErrorKind::ExecutionFailed),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -328,6 +339,7 @@ impl ShellTool {
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
+                error_kind: Some(ErrorKind::Timeout),
             }),
         }
     }
@@ -342,6 +354,7 @@ impl ShellTool {
                     "Background task limit reached ({MAX_BACKGROUND_TASKS}). \
                      Kill or wait for existing tasks before starting new ones."
                 )),
+                error_kind: Some(ErrorKind::RateLimited),
             });
         }
 
@@ -354,6 +367,7 @@ impl ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to create background_tasks directory: {e}")),
+                error_kind: Some(ErrorKind::ExecutionFailed),
             });
         }
         let log_path = log_dir.join(format!("{task_id}.log"));
@@ -365,6 +379,7 @@ impl ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to create log file: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -375,6 +390,7 @@ impl ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to clone log file handle: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -389,6 +405,7 @@ impl ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -408,6 +425,7 @@ impl ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to spawn background command: {e}")),
+                    error_kind: Some(ErrorKind::ExecutionFailed),
                 });
             }
         };
@@ -473,6 +491,7 @@ impl ShellTool {
             })
             .to_string(),
             error: None,
+            error_kind: None,
         })
     }
 }

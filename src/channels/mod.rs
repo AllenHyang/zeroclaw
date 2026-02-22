@@ -1725,6 +1725,7 @@ async fn process_channel_message(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 },
+                Some(ctx.workspace_dir.as_path()),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -4030,6 +4031,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
+                    error_kind: None,
                 });
             }
 
@@ -4037,6 +4039,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
+                error_kind: None,
             })
         }
     }

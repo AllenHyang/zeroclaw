@@ -77,7 +77,8 @@ impl Tool for ShellStatusTool {
                 error: Some(format!(
                     "Unknown action: '{action}'. Use: status, output, list, kill"
                 )),
-            }),
+                error_kind: None,
+}),
         }
     }
 }
@@ -90,6 +91,7 @@ impl ShellStatusTool {
                 success: true,
                 output: "No background tasks.".to_string(),
                 error: None,
+                error_kind: None,
             });
         }
 
@@ -110,6 +112,7 @@ impl ShellStatusTool {
             success: true,
             output: serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()),
             error: None,
+            error_kind: None,
         })
     }
 
@@ -127,11 +130,13 @@ impl ShellStatusTool {
                 })
                 .to_string(),
                 error: None,
+                error_kind: None,
             }),
             None => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("No task found with id '{task_id}'")),
+                error_kind: None,
             }),
         }
     }
@@ -144,6 +149,7 @@ impl ShellStatusTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("No task found with id '{task_id}'")),
+                    error_kind: None,
                 });
             }
         };
@@ -173,17 +179,20 @@ impl ShellStatusTool {
                     success: true,
                     output,
                     error: None,
+                    error_kind: None,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some("Log file not found (task may not have started yet)".to_string()),
+                error_kind: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to read log file: {e}")),
+                error_kind: None,
             }),
         }
     }
@@ -196,6 +205,7 @@ impl ShellStatusTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("No task found with id '{task_id}'")),
+                    error_kind: None,
                 });
             }
         };
@@ -208,7 +218,8 @@ impl ShellStatusTool {
                     "Task '{task_id}' is not running (status: {})",
                     status_string(&task.status)
                 )),
-            });
+                error_kind: None,
+});
         }
 
         // Send SIGTERM via the kill command.
@@ -229,6 +240,7 @@ impl ShellStatusTool {
             success: true,
             output: format!("Sent SIGTERM to task '{task_id}' (pid {}).", task.pid),
             error: None,
+            error_kind: None,
         })
     }
 }

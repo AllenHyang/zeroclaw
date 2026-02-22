@@ -109,6 +109,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Empty pattern is not allowed.".into()),
+                error_kind: None,
             });
         }
 
@@ -126,7 +127,8 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Invalid output_mode '{output_mode}'. Allowed values: content, files_with_matches, count."
                 )),
-            });
+                error_kind: None,
+});
         }
 
         let include = args.get("include").and_then(|v| v.as_str());
@@ -167,6 +169,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error_kind: None,
             });
         }
 
@@ -176,6 +179,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Absolute paths are not allowed. Use a relative path.".into()),
+                error_kind: None,
             });
         }
 
@@ -184,6 +188,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed.".into()),
+                error_kind: None,
             });
         }
 
@@ -194,7 +199,8 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Path '{search_path}' is not allowed by security policy."
                 )),
-            });
+                error_kind: None,
+});
         }
 
         // Record action to consume rate limit budget
@@ -203,6 +209,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                error_kind: None,
             });
         }
 
@@ -217,6 +224,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Cannot resolve path '{search_path}': {e}")),
+                    error_kind: None,
                 });
             }
         };
@@ -228,7 +236,8 @@ impl Tool for ContentSearchTool {
                 error: Some(format!(
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
-            });
+                error_kind: None,
+});
         }
 
         // --- Multiline check for grep fallback ---
@@ -239,7 +248,8 @@ impl Tool for ContentSearchTool {
                 error: Some(
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
-            });
+                error_kind: None,
+});
         }
 
         // --- Build and execute command ---
@@ -289,6 +299,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to execute search command: {e}")),
+                    error_kind: None,
                 });
             }
             Err(_) => {
@@ -296,6 +307,7 @@ impl Tool for ContentSearchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Search timed out after {TIMEOUT_SECS} seconds.")),
+                    error_kind: None,
                 });
             }
         };
@@ -308,6 +320,7 @@ impl Tool for ContentSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Search error: {}", stderr.trim())),
+                error_kind: None,
             });
         }
 
@@ -336,6 +349,7 @@ impl Tool for ContentSearchTool {
             success: true,
             output: final_output,
             error: None,
+            error_kind: None,
         })
     }
 }
