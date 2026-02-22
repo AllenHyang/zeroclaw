@@ -5798,4 +5798,67 @@ Let me check the result."#;
         assert!(prompt.contains("Command not allowed"));
         assert!(prompt.contains("STOP retrying"));
     }
+    // ═══════════════════════════════════════════════════════════════════════
+    // reasoning_content pass-through tests for history builders
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn build_native_assistant_history_includes_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_omits_reasoning_content_when_none() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
 }
