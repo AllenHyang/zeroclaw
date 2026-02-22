@@ -470,6 +470,65 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             continue;
         }
 
+        // ── Reflection: detect stalled goals before executing steps ──
+        let stalled = GoalEngine::find_stalled_goals(&state);
+        for gi in stalled {
+            tracing::info!(
+                goal = %state.goals[gi].description,
+                "Goal loop: goal stalled, triggering reflection"
+            );
+            let prompt = GoalEngine::build_reflection_prompt(&state.goals[gi]);
+            let temp = config.default_temperature;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                    true,
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    tracing::info!(
+                        goal = %state.goals[gi].description,
+                        "Goal reflection completed"
+                    );
+                    // Reload state — the agent may have modified goals.json
+                    state = match engine.load_state().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("Goal loop: failed to reload state after reflection: {e}");
+                            break;
+                        }
+                    };
+                    notify_goal_event(
+                        &config,
+                        &format!(
+                            "Goal reflection: {}\n{}",
+                            state.goals.get(gi).map(|g| g.description.as_str()).unwrap_or("?"),
+                            crate::util::truncate_with_ellipsis(&output, 300),
+                        ),
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Goal reflection failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!("Goal reflection timed out");
+                }
+            }
+        }
+
+        // ── Normal step execution ───────────────────────────────────
         for _ in 0..max_steps {
             let Some((gi, si)) = GoalEngine::select_next_actionable(&state) else {
                 break;

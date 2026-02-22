@@ -259,6 +259,76 @@ impl GoalEngine {
     pub fn max_step_attempts() -> u32 {
         MAX_STEP_ATTEMPTS
     }
+
+    /// Find in-progress goals that have no actionable steps remaining.
+    ///
+    /// A goal is "stalled" when it is `InProgress` but every step is either
+    /// completed, blocked, or has exhausted its retry attempts. These goals
+    /// need a reflection session to decide: add new steps, mark completed,
+    /// mark blocked, or escalate to the user.
+    pub fn find_stalled_goals(state: &GoalState) -> Vec<usize> {
+        state
+            .goals
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.status == GoalStatus::InProgress)
+            .filter(|(_, g)| {
+                !g.steps.is_empty()
+                    && !g.steps.iter().any(|s| {
+                        s.status == StepStatus::Pending && s.attempts < MAX_STEP_ATTEMPTS
+                    })
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Build a reflection prompt for a stalled goal.
+    ///
+    /// The agent is asked to review the goal's overall progress and decide
+    /// what to do next: add new steps, mark the goal completed, or escalate.
+    pub fn build_reflection_prompt(goal: &Goal) -> String {
+        let mut prompt = String::new();
+
+        let _ = writeln!(
+            prompt,
+            "[Goal Reflection] Goal: {}\n",
+            goal.description
+        );
+
+        prompt.push_str("All steps have been attempted. Here is the current state:\n\n");
+
+        for s in &goal.steps {
+            let status_tag = match s.status {
+                StepStatus::Completed => "done",
+                StepStatus::Failed | StepStatus::Blocked => "blocked",
+                _ if s.attempts >= MAX_STEP_ATTEMPTS => "exhausted",
+                _ => "pending",
+            };
+            let result = s.result.as_deref().unwrap_or("(no result)");
+            let _ = writeln!(prompt, "- [{status_tag}] {}: {result}", s.description);
+        }
+
+        if !goal.context.is_empty() {
+            let _ = write!(prompt, "\nAccumulated context:\n{}\n", goal.context);
+        }
+
+        if let Some(ref err) = goal.last_error {
+            let _ = write!(prompt, "\nLast error: {err}\n");
+        }
+
+        prompt.push_str(
+            "\nReflect on this goal and take ONE of the following actions:\n\
+             1. If the goal is effectively achieved, update state/goals.json to mark it `completed`.\n\
+             2. If some steps failed but you can try a different approach, add NEW steps to \
+                state/goals.json with fresh descriptions (don't reuse failed step IDs).\n\
+             3. If the goal is truly blocked and needs human input, mark it `blocked` in \
+                state/goals.json and explain what you need from the user.\n\
+             4. Use memory_store to record what you learned from the failures.\n\n\
+             Be decisive. Do not leave the goal in its current state.",
+        );
+
+        prompt
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +540,112 @@ target = "oc_test"
     #[test]
     fn step_status_default_is_pending() {
         assert_eq!(StepStatus::default(), StepStatus::Pending);
+    }
+
+    #[test]
+    fn find_stalled_goals_detects_exhausted_steps() {
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "Stalled goal".into(),
+                status: GoalStatus::InProgress,
+                priority: GoalPriority::High,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![
+                    Step {
+                        id: "s1".into(),
+                        description: "Done step".into(),
+                        status: StepStatus::Completed,
+                        result: Some("ok".into()),
+                        attempts: 1,
+                    },
+                    Step {
+                        id: "s2".into(),
+                        description: "Exhausted step".into(),
+                        status: StepStatus::Pending,
+                        result: None,
+                        attempts: 3, // >= MAX_STEP_ATTEMPTS
+                    },
+                ],
+                context: String::new(),
+                last_error: Some("step failed 3 times".into()),
+            }],
+        };
+
+        let stalled = GoalEngine::find_stalled_goals(&state);
+        assert_eq!(stalled, vec![0]);
+    }
+
+    #[test]
+    fn find_stalled_goals_ignores_actionable_goals() {
+        let state = sample_goal_state(); // has pending steps with attempts=0
+        let stalled = GoalEngine::find_stalled_goals(&state);
+        assert!(stalled.is_empty());
+    }
+
+    #[test]
+    fn find_stalled_goals_ignores_completed_goals() {
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "Done".into(),
+                status: GoalStatus::Completed,
+                priority: GoalPriority::Medium,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![Step {
+                    id: "s1".into(),
+                    description: "Only step".into(),
+                    status: StepStatus::Completed,
+                    result: Some("ok".into()),
+                    attempts: 1,
+                }],
+                context: String::new(),
+                last_error: None,
+            }],
+        };
+
+        let stalled = GoalEngine::find_stalled_goals(&state);
+        assert!(stalled.is_empty());
+    }
+
+    #[test]
+    fn build_reflection_prompt_includes_step_summary() {
+        let goal = Goal {
+            id: "g1".into(),
+            description: "Test reflection".into(),
+            status: GoalStatus::InProgress,
+            priority: GoalPriority::High,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![
+                Step {
+                    id: "s1".into(),
+                    description: "Completed step".into(),
+                    status: StepStatus::Completed,
+                    result: Some("worked".into()),
+                    attempts: 1,
+                },
+                Step {
+                    id: "s2".into(),
+                    description: "Failed step".into(),
+                    status: StepStatus::Pending,
+                    result: None,
+                    attempts: 3,
+                },
+            ],
+            context: "some context".into(),
+            last_error: Some("policy_denied".into()),
+        };
+
+        let prompt = GoalEngine::build_reflection_prompt(&goal);
+        assert!(prompt.contains("[Goal Reflection]"));
+        assert!(prompt.contains("Test reflection"));
+        assert!(prompt.contains("[done] Completed step"));
+        assert!(prompt.contains("[exhausted] Failed step"));
+        assert!(prompt.contains("some context"));
+        assert!(prompt.contains("policy_denied"));
+        assert!(prompt.contains("memory_store"));
     }
 }
