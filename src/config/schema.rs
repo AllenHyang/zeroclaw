@@ -2347,6 +2347,12 @@ pub struct GoalLoopConfig {
     /// Maximum exploration runs per calendar day (UTC). Default: `6`.
     #[serde(default = "default_max_explorations_per_day")]
     pub max_explorations_per_day: u32,
+
+    /// Auto-approve pending goals with priority `low` created by idle
+    /// exploration.  When enabled, the goal loop promotes these to
+    /// `in_progress` without waiting for human approval.  Default: `false`.
+    #[serde(default)]
+    pub auto_approve_low_priority: bool,
 }
 
 fn default_explore_cooldown_minutes() -> u32 {
@@ -2369,6 +2375,7 @@ impl Default for GoalLoopConfig {
             explore_when_idle: false,
             explore_cooldown_minutes: default_explore_cooldown_minutes(),
             max_explorations_per_day: default_max_explorations_per_day(),
+            auto_approve_low_priority: false,
         }
     }
 }

@@ -279,32 +279,40 @@ impl GoalEngine {
              1. Use memory_recall with query \"exploration journal\" to retrieve your past\n\
              \x20  exploration entries (category: exploration). Review what you explored\n\
              \x20  before, what you found, and what directions you suggested for next time.\n\
-             2. Use memory_recall with query \"consolidation\" to retrieve recent nightly\n\
+             2. Use memory_recall with query \"exploration scores\" to retrieve the latest\n\
+             \x20  exploration scorecard (category: exploration, key: exploration-scores-*).\n\
+             \x20  This tells you which directions scored well (continue) and which scored\n\
+             \x20  poorly (deprioritize). DO NOT repeat directions listed in\n\
+             \x20  `directions_to_deprioritize` unless you have a strong new reason.\n\
+             3. Use memory_recall with query \"consolidation\" to retrieve recent nightly\n\
              \x20  consolidation summaries (category: core). These distill the full day's\n\
              \x20  activity — cron results, errors, and discoveries you may have missed.\n\
-             3. Use memory_recall to review recent daily activity entries.\n\
-             4. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
-             5. REFLECT on your exploration history AND consolidation learnings:\n\
+             4. Use memory_recall to review recent daily activity entries.\n\
+             5. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
+             6. REFLECT on your exploration history, scores, AND consolidation learnings:\n\
              \x20  - Am I stuck in a rut, repeating the same topics?\n\
-             \x20  - Did my previous explorations produce actionable results, or just noise?\n\
+             \x20  - Which past explorations scored well? Why? How can I build on them?\n\
+             \x20  - Which scored poorly? Am I about to repeat a deprioritized direction?\n\
              \x20  - Has the user's situation changed (new conversations, new priorities)?\n\
              \x20  - What blind spots might I have? What am I NOT looking at?\n\n\
              == Phase 2: Explore with Intent ==\n\
-             6. Based on your reflection, choose ONE direction to explore. Prefer:\n\
+             7. Based on your reflection, choose ONE direction to explore. Prefer:\n\
+             \x20  - Directions listed in `directions_to_continue` from the scorecard\n\
              \x20  - Directions you suggested in your last journal entry\n\
              \x20  - Consolidation learnings that suggest unfinished threads\n\
              \x20  - Blind spots or areas you haven't covered recently\n\
              \x20  - Follow-ups to completed goals that might have new developments\n\
-             \x20  - Unblocking stuck goals with fresh approaches\n\
-             \x20  Over: repeating recent topics, or picking whatever is easiest.\n\
-             7. If you identify a valuable new goal:\n\
+             \x20  AVOID: directions in `directions_to_deprioritize`, recent repeats.\n\
+             8. If you identify a valuable new goal:\n\
              \x20  a. VERIFY the precondition first (e.g., check if data exists, if a\n\
              \x20     service is reachable, if the user hasn't already addressed it)\n\
              \x20  b. Only if preconditions hold: write it to state/goals.json with\n\
              \x20     status \"pending\", priority \"low\", and 3-5 concrete steps\n\
-             \x20  c. Notify the user with a brief rationale\n\n\
+             \x20  c. Goals with priority \"low\" will be auto-approved and executed\n\
+             \x20     by the goal loop without waiting for human approval\n\
+             \x20  d. Notify the user with a brief rationale\n\n\
              == Phase 3: Journal ==\n\
-             8. ALWAYS end by writing an exploration journal entry using memory_store.\n\
+             9. ALWAYS end by writing an exploration journal entry using memory_store.\n\
              \x20  Use key \"exploration-journal-YYYY-MM-DD-N\" (N = sequence number today).\n\
              \x20  Use category \"exploration\". Include:\n\
              \x20  - What you explored and why\n\
@@ -313,7 +321,7 @@ impl GoalEngine {
              \x20  - 2-3 specific directions for next exploration (not vague, be concrete)\n\
              \x20  - Any shifts in your mental model of the user's priorities\n\n\
              == Constraints ==\n\
-             - Max 10 tool calls total.\n\
+             - Max 12 tool calls total.\n\
              - If nothing valuable surfaces, say so briefly. Do not force a goal.\n\
              - Quality over quantity. One deep insight beats five shallow scans.\n",
         );
@@ -1164,6 +1172,7 @@ max_explorations_per_day = 4
         assert!(!config.explore_when_idle);
         assert_eq!(config.explore_cooldown_minutes, 60);
         assert_eq!(config.max_explorations_per_day, 6);
+        assert!(!config.auto_approve_low_priority);
     }
 
     #[test]
@@ -1179,5 +1188,43 @@ max_steps_per_cycle = 3
         assert!(!config.explore_when_idle);
         assert_eq!(config.explore_cooldown_minutes, 60);
         assert_eq!(config.max_explorations_per_day, 6);
+        assert!(!config.auto_approve_low_priority);
+    }
+
+    #[test]
+    fn goal_loop_config_auto_approve_serde() {
+        let toml_str = r#"
+enabled = true
+interval_minutes = 10
+step_timeout_secs = 120
+max_steps_per_cycle = 3
+auto_approve_low_priority = true
+"#;
+        let config: crate::config::GoalLoopConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.auto_approve_low_priority);
+    }
+
+    #[test]
+    fn exploration_prompt_mentions_auto_approve() {
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(
+            prompt.contains("auto-approved"),
+            "exploration prompt should inform agent about auto-approval"
+        );
+    }
+
+    #[test]
+    fn exploration_prompt_mentions_scorecard() {
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(
+            prompt.contains("exploration scores"),
+            "exploration prompt should read scorecard"
+        );
+        assert!(
+            prompt.contains("directions_to_deprioritize"),
+            "exploration prompt should mention deprioritize list"
+        );
     }
 }

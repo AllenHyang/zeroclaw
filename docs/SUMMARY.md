@@ -79,7 +79,11 @@ Last refreshed: **February 18, 2026**.
 - [ci-map.md](ci-map.md)
 - [actions-source-policy.md](actions-source-policy.md)
 
-### 7) Project Status & Snapshot
+### 7) Architecture & Design
+
+- [self-evolution-design.md](self-evolution-design.md)
+
+### 8) Project Status & Snapshot
 
 - [project/README.md](project/README.md)
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)

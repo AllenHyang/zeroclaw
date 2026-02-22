@@ -13,7 +13,7 @@ pub const CONSOLIDATION_JOB_NAME: &str = "__consolidate_nightly";
 const CONSOLIDATION_PROMPT: &str = "\
 You are running a nightly memory consolidation job. Your goal is to distill \
 the past 24 hours of operational activity into a concise, actionable summary \
-stored in long-term memory.
+stored in long-term memory, AND to score the quality of today's explorations.
 
 Follow these steps exactly:
 
@@ -28,21 +28,40 @@ Follow these steps exactly:
    exploration journal entries (category: exploration). These contain autonomous \
    discoveries, self-critiques, and suggested next directions from idle exploration.
 
-4. Identify and classify findings from ALL sources (cron runs, daily memories, \
+4. **Score each exploration journal entry** on a 1-5 scale:
+   - 5: Led to a concrete, actionable goal or a verified new capability
+   - 4: Produced a valuable insight that changes understanding or unblocks work
+   - 3: Useful information gathered, but no immediate action resulted
+   - 2: Mostly noise — repeated known information or explored a dead end
+   - 1: Complete waste — no findings, wrong direction, or repeated a recent topic
+   For each entry, note: the key, the score, and a one-line reason.
+
+5. Identify and classify findings from ALL sources (cron runs, daily memories, \
    AND exploration journals):
    - **Recurring errors**: problems that appeared more than once
    - **Successful strategies**: approaches that worked well
    - **New discoveries**: information or capabilities learned
    - **Blocked goals**: objectives that could not be completed and why
-   - **Exploration insights**: valuable findings from idle exploration
+   - **Exploration insights**: valuable findings from scored explorations (4-5 only)
 
-5. Synthesize a concise summary (max 500 words) of actionable learnings. \
+6. Synthesize a concise summary (max 500 words) of actionable learnings. \
    Focus on what should change going forward, not just what happened.
 
-6. Store the summary using `memory_store` with category \"core\" and \
-   key format \"consolidation_YYYY-MM-DD\" (use today's date).
+7. Store the summary using `memory_store` with category \"core\" and \
+   key format \"consolidation_YYYY-MM-DD\" (use today's date). Include the \
+   exploration scores in the summary.
 
-7. If the workspace file `MEMORY.md` exists, use `file_read` to read it, \
+8. Store the exploration scorecard separately using `memory_store` with \
+   category \"exploration\" and key \"exploration-scores-YYYY-MM-DD\". Format:
+   ```
+   score=<avg_score>
+   <key1>: <score>/5 — <reason>
+   <key2>: <score>/5 — <reason>
+   directions_to_deprioritize: <comma-separated low-scoring directions>
+   directions_to_continue: <comma-separated high-scoring directions>
+   ```
+
+9. If the workspace file `MEMORY.md` exists, use `file_read` to read it, \
    then use `file_write` to append a dated section at the end with the \
    top 3 learnings from today's consolidation. Format:
    ```
@@ -54,7 +73,7 @@ Follow these steps exactly:
 
 If there is no meaningful activity to consolidate (no runs, no daily memories, \
 no exploration journals), store a brief note confirming the check was performed \
-and skip the MEMORY.md update.";
+and skip the MEMORY.md and scorecard updates.";
 
 /// Create a nightly memory consolidation cron agent job.
 ///
@@ -173,6 +192,18 @@ mod tests {
         assert!(
             prompt.contains("__idle_exploration"),
             "prompt should reference idle exploration runs"
+        );
+        assert!(
+            prompt.contains("Score each exploration"),
+            "prompt should include exploration scoring instructions"
+        );
+        assert!(
+            prompt.contains("exploration-scores-YYYY-MM-DD"),
+            "prompt should specify scorecard key format"
+        );
+        assert!(
+            prompt.contains("directions_to_deprioritize"),
+            "prompt should output deprioritize list"
         );
     }
 

@@ -507,7 +507,7 @@ async fn check_network_reachable(config: &Config) -> bool {
 }
 
 async fn run_goal_loop_worker(config: Config) -> Result<()> {
-    use crate::goals::engine::{GoalEngine, GoalStatus, StepStatus};
+    use crate::goals::engine::{GoalEngine, GoalPriority, GoalStatus, StepStatus};
 
     let engine = GoalEngine::new(&config.workspace_dir);
     let interval_mins = config.goal_loop.interval_minutes.max(1);
@@ -531,6 +531,36 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 continue;
             }
         };
+
+        // ── Auto-approve: promote pending low-priority goals ─────────
+        if config.goal_loop.auto_approve_low_priority {
+            let mut promoted = false;
+            for goal in &mut state.goals {
+                if goal.status == GoalStatus::Pending
+                    && goal.priority == GoalPriority::Low
+                    && !goal.steps.is_empty()
+                {
+                    goal.status = GoalStatus::InProgress;
+                    goal.updated_at = chrono::Utc::now().to_rfc3339();
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        goal = %goal.description,
+                        "Goal loop: auto-approved low-priority goal"
+                    );
+                    promoted = true;
+                }
+            }
+            if promoted {
+                if let Err(e) = engine.save_state(&state).await {
+                    tracing::warn!("Goal loop: failed to save state after auto-approve: {e}");
+                }
+                notify_goal_event(
+                    &config,
+                    "Goal loop: auto-approved pending low-priority goals",
+                )
+                .await;
+            }
+        }
 
         // ── Idle exploration: no actionable goals ────────────────────
         if state.goals.is_empty() || !has_actionable_goals(&state) {
