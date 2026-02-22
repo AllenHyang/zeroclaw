@@ -1,8 +1,8 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
-#[cfg(feature = "channel-lark")]
-use crate::channels::LarkChannel;
 use crate::config::Config;
 use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
@@ -137,6 +137,21 @@ async fn execute_and_persist_job(
     (job.id.clone(), success)
 }
 
+fn build_agent_prompt(job: &CronJob) -> String {
+    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
+    let prompt = job.prompt.clone().unwrap_or_default();
+    let mut prefixed = format!("[cron:{} {name}] {prompt}", job.id);
+
+    if let Some(ref last) = job.last_output {
+        if !last.is_empty() {
+            prefixed.push_str("\n\n[Previous run result]\n");
+            prefixed.push_str(last);
+        }
+    }
+
+    prefixed
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
@@ -162,9 +177,7 @@ async fn run_agent_job(
             "blocked by security policy: action budget exhausted".to_string(),
         );
     }
-    let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
-    let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+    let prefixed_prompt = build_agent_prompt(job);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -930,5 +943,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lark channel not configured"));
+    }
+
+    #[test]
+    fn build_agent_prompt_includes_last_output_when_present() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.name = Some("health-check".into());
+        job.last_output = Some("previous result".into());
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.starts_with("[cron:test-job health-check] Check status"));
+        assert!(prompt.contains("\n\n[Previous run result]\n"));
+        assert!(prompt.contains("previous result"));
+    }
+
+    #[test]
+    fn build_agent_prompt_omits_section_when_last_output_is_none() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.last_output = None;
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.contains("[cron:test-job cron-job] Check status"));
+        assert!(!prompt.contains("[Previous run result]"));
+    }
+
+    #[test]
+    fn build_agent_prompt_omits_section_when_last_output_is_empty() {
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Check status".into());
+        job.last_output = Some(String::new());
+
+        let prompt = build_agent_prompt(&job);
+        assert!(prompt.contains("[cron:test-job cron-job] Check status"));
+        assert!(!prompt.contains("[Previous run result]"));
     }
 }

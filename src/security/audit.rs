@@ -21,6 +21,7 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    ToolCallAudit,
 }
 
 /// Actor information (who performed the action)
@@ -233,6 +234,34 @@ impl AuditLogger {
         })
     }
 
+    /// Log a tool call audit event.
+    ///
+    /// Records tool name, success/failure, duration, and an optional error label.
+    /// Does NOT log raw arguments or output to avoid leaking sensitive data.
+    pub fn log_tool_call(
+        &self,
+        tool_name: &str,
+        success: bool,
+        duration_ms: u64,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let risk_level = match tool_name {
+            "shell" | "file_write" | "file_edit" => "medium",
+            _ => "low",
+        };
+
+        let event = AuditEvent::new(AuditEventType::ToolCallAudit)
+            .with_action(
+                tool_name.to_string(),
+                risk_level.to_string(),
+                true, // approved (already past approval gate)
+                true, // allowed (already past policy gate)
+            )
+            .with_result(success, None, duration_ms, error.map(|e| e.to_string()));
+
+        self.log(&event)
+    }
+
     /// Rotate log if it exceeds max size
     fn rotate_if_needed(&self) -> Result<()> {
         if let Ok(metadata) = std::fs::metadata(&self.log_path) {
@@ -418,6 +447,125 @@ mod tests {
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"
         );
+        Ok(())
+    }
+
+    // ── §8.2 ToolCallAudit tests ────────────────────────────
+
+    #[test]
+    fn tool_call_audit_serialization_roundtrip() {
+        let event = AuditEvent::new(AuditEventType::ToolCallAudit)
+            .with_action("shell".to_string(), "medium".to_string(), true, true)
+            .with_result(true, None, 150, None);
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let parsed: AuditEvent = serde_json::from_str(&json).expect("deserialize");
+
+        match parsed.event_type {
+            AuditEventType::ToolCallAudit => {}
+            other => panic!("expected ToolCallAudit, got {:?}", other),
+        }
+        let action = parsed.action.unwrap();
+        assert_eq!(action.command, Some("shell".to_string()));
+        assert_eq!(action.risk_level, Some("medium".to_string()));
+    }
+
+    #[tokio::test]
+    async fn log_tool_call_writes_to_audit_file() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_tool_call("file_read", true, 25, None)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = tokio::fs::read_to_string(&log_path).await?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        match parsed.event_type {
+            AuditEventType::ToolCallAudit => {}
+            other => panic!("expected ToolCallAudit, got {:?}", other),
+        }
+        let action = parsed.action.unwrap();
+        assert_eq!(action.command, Some("file_read".to_string()));
+        assert_eq!(action.risk_level, Some("low".to_string()));
+        assert!(parsed.result.unwrap().success);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn log_tool_call_records_error_label_without_raw_args() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log_tool_call("shell", false, 100, Some("permission_denied"))?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = tokio::fs::read_to_string(&log_path).await?;
+
+        // Verify the raw content does not contain argument-like data
+        assert!(!content.contains("arguments"));
+        assert!(!content.contains("output"));
+
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        let result = parsed.result.unwrap();
+        assert!(!result.success);
+        assert_eq!(result.error, Some("permission_denied".to_string()));
+        assert_eq!(
+            parsed.action.unwrap().risk_level,
+            Some("medium".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn log_tool_call_assigns_risk_levels_correctly() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // Medium-risk tools
+        for tool in &["shell", "file_write", "file_edit"] {
+            logger.log_tool_call(tool, true, 10, None)?;
+        }
+        // Low-risk tools
+        for tool in &["file_read", "memory_recall", "browser_snapshot"] {
+            logger.log_tool_call(tool, true, 10, None)?;
+        }
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let events: Vec<AuditEvent> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse audit line"))
+            .collect();
+
+        assert_eq!(events.len(), 6);
+        for event in &events[..3] {
+            assert_eq!(
+                event.action.as_ref().unwrap().risk_level,
+                Some("medium".to_string())
+            );
+        }
+        for event in &events[3..] {
+            assert_eq!(
+                event.action.as_ref().unwrap().risk_level,
+                Some("low".to_string())
+            );
+        }
         Ok(())
     }
 }

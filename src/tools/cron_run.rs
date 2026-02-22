@@ -153,7 +153,7 @@ impl Tool for CronRunTool {
                 Some("cron job execution failed".to_string())
             },
             error_kind: None,
-})
+        })
     }
 }
 

@@ -1801,6 +1801,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1820,6 +1821,7 @@ pub(crate) async fn agent_turn(
         None,
         &[],
         None,
+        audit_logger,
     )
     .await
 }
@@ -1830,6 +1832,7 @@ async fn execute_one_tool(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<ToolExecutionOutcome> {
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
@@ -1863,7 +1866,7 @@ async fn execute_one_tool(
         tool_future.await
     };
 
-    match tool_result {
+    let outcome = match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
             observer.record_event(&ObserverEvent::ToolCall {
@@ -1872,26 +1875,26 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if r.success {
-                Ok(ToolExecutionOutcome {
+                ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
                     success: true,
                     error_reason: None,
                     error_kind: None,
                     duration,
-                })
+                }
             } else {
                 let reason = r.error.unwrap_or(r.output);
                 let kind_tag = r
                     .error_kind
                     .map(|k| format!(" [{}]", k.as_label()))
                     .unwrap_or_default();
-                Ok(ToolExecutionOutcome {
+                ToolExecutionOutcome {
                     output: format!("Error{kind_tag}: {reason}"),
                     success: false,
                     error_reason: Some(scrub_credentials(&reason)),
                     error_kind: r.error_kind,
                     duration,
-                })
+                }
             }
         }
         Err(e) => {
@@ -1902,15 +1905,43 @@ async fn execute_one_tool(
                 success: false,
             });
             let reason = format!("Error executing {call_name}: {e}");
-            Ok(ToolExecutionOutcome {
+            ToolExecutionOutcome {
                 output: reason.clone(),
                 success: false,
                 error_reason: Some(scrub_credentials(&reason)),
                 error_kind: None,
                 duration,
-            })
+            }
+        }
+    };
+
+    // ── Audit: log tool call outcome (fail-open) ──────────────
+    #[allow(clippy::cast_possible_truncation)] // duration_ms fits u64
+    if let Some(audit) = audit_logger {
+        let error_label = if outcome.success {
+            None
+        } else {
+            outcome
+                .error_kind
+                .as_ref()
+                .map(|k| k.as_label())
+                .or(Some("tool_execution_failed"))
+        };
+        if let Err(e) = audit.log_tool_call(
+            call_name,
+            outcome.success,
+            outcome.duration.as_millis() as u64,
+            error_label,
+        ) {
+            tracing::warn!(
+                tool = call_name,
+                error = %e,
+                "audit: failed to write tool call event"
+            );
         }
     }
+
+    Ok(outcome)
 }
 
 struct ToolExecutionOutcome {
@@ -2076,6 +2107,7 @@ async fn execute_tools_parallel(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2086,6 +2118,7 @@ async fn execute_tools_parallel(
                 tools_registry,
                 observer,
                 cancellation_token,
+                audit_logger,
             )
         })
         .collect();
@@ -2099,6 +2132,7 @@ async fn execute_tools_sequential(
     tools_registry: &[Box<dyn Tool>],
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2110,6 +2144,7 @@ async fn execute_tools_sequential(
                 tools_registry,
                 observer,
                 cancellation_token,
+                audit_logger,
             )
             .await?,
         );
@@ -2151,6 +2186,7 @@ pub(crate) async fn run_tool_call_loop(
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     workspace_dir: Option<&std::path::Path>,
+    audit_logger: Option<&crate::security::AuditLogger>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2652,6 +2688,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                audit_logger,
             )
             .await?
         } else {
@@ -2660,6 +2697,7 @@ pub(crate) async fn run_tool_call_loop(
                 tools_registry,
                 observer,
                 cancellation_token.as_ref(),
+                audit_logger,
             )
             .await?
         };
@@ -2931,6 +2969,24 @@ pub async fn run(
         model: model_name.to_string(),
     });
 
+    // ── Audit logger (tool call audit) ──────────────────────────
+    let audit_logger = if config.security.audit.enabled {
+        let zeroclaw_dir = config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| config.workspace_dir.clone());
+        match crate::security::AuditLogger::new(config.security.audit.clone(), zeroclaw_dir) {
+            Ok(logger) => Some(logger),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create audit logger; tool call audit disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
     let hardware_rag: Option<crate::rag::HardwareRag> = config
         .peripherals
@@ -3144,6 +3200,7 @@ pub async fn run(
             None,
             &[],
             Some(&config.workspace_dir),
+            audit_logger.as_ref(),
         )
         .await?;
         final_output = response.clone();
@@ -3266,6 +3323,7 @@ pub async fn run(
                 None,
                 &[],
                 Some(&config.workspace_dir),
+                audit_logger.as_ref(),
             )
             .await
             {
@@ -3494,6 +3552,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        None,
     )
     .await
 }
@@ -3810,6 +3869,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -3857,6 +3917,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -3897,6 +3958,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -4025,6 +4087,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -4095,6 +4158,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -4151,6 +4215,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -5619,7 +5684,10 @@ Let me check the result."#;
         .unwrap();
 
         let result = StateReconciliation::new_if_applicable(&dir);
-        assert!(result.is_none(), "should not create when no in_progress goals");
+        assert!(
+            result.is_none(),
+            "should not create when no in_progress goals"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

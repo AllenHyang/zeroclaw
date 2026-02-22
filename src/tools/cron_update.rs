@@ -25,7 +25,7 @@ impl CronUpdateTool {
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         if self.security.is_rate_limited() {

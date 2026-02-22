@@ -85,8 +85,8 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
-pub use traits::Tool;
 pub use traits::ErrorKind;
+pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use web_search_tool::WebSearchTool;

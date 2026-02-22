@@ -167,7 +167,7 @@ impl Tool for ImageInfoTool {
                     "Path not allowed: {path_str} (must be within workspace)"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         if !path.exists() {
@@ -193,7 +193,7 @@ impl Tool for ImageInfoTool {
                     "Image too large: {file_size} bytes (max {MAX_IMAGE_BYTES} bytes)"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         let bytes = tokio::fs::read(path)

@@ -90,7 +90,7 @@ impl Tool for HardwareMemoryMapTool {
                         .into(),
                 ),
                 error_kind: None,
-});
+            });
         }
 
         let mut output = String::new();

@@ -291,7 +291,7 @@ impl Tool for HttpRequestTool {
                         None
                     },
                     error_kind: None,
-})
+                })
             }
             Err(e) => Ok(ToolResult {
                 success: false,

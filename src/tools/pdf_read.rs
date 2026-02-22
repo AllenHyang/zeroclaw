@@ -126,7 +126,7 @@ impl Tool for PdfReadTool {
                         .resolved_path_violation_message(&resolved_path),
                 ),
                 error_kind: None,
-});
+            });
         }
 
         tracing::debug!("Reading PDF: {}", resolved_path.display());
@@ -142,7 +142,7 @@ impl Tool for PdfReadTool {
                             meta.len()
                         )),
                         error_kind: None,
-});
+                    });
                 }
             }
             Err(e) => {
@@ -236,7 +236,7 @@ impl Tool for PdfReadTool {
                         .into(),
                 ),
                 error_kind: None,
-})
+            })
         }
     }
 }

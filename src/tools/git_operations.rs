@@ -538,7 +538,7 @@ impl Tool for GitOperationsTool {
                         "Action blocked: git write operations require higher autonomy level".into(),
                     ),
                     error_kind: None,
-});
+                });
             }
 
             match self.security.autonomy {

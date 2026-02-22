@@ -151,7 +151,7 @@ impl ScreenshotTool {
                     "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
                 )),
                 error_kind: None,
-}),
+            }),
         }
     }
 

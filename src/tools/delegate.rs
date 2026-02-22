@@ -214,7 +214,7 @@ impl Tool for DelegateTool {
                         }
                     )),
                     error_kind: None,
-});
+                });
             }
         };
 
@@ -230,7 +230,7 @@ impl Tool for DelegateTool {
                     max = agent_config.max_depth
                 )),
                 error_kind: None,
-});
+            });
         }
 
         if let Err(error) = self
@@ -268,7 +268,7 @@ impl Tool for DelegateTool {
                         agent_config.provider
                     )),
                     error_kind: None,
-});
+                });
             }
         };
 
@@ -316,7 +316,7 @@ impl Tool for DelegateTool {
                         "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
                     )),
                     error_kind: None,
-});
+                });
             }
         };
 
@@ -365,7 +365,7 @@ impl DelegateTool {
                     "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         let allowed = agent_config
@@ -392,7 +392,7 @@ impl DelegateTool {
                     agent_config.allowed_tools.join(", ")
                 )),
                 error_kind: None,
-});
+            });
         }
 
         let mut history = Vec::new();
@@ -423,6 +423,7 @@ impl DelegateTool {
                 None,
                 &[],
                 None,
+                None, // sub-agent tool calls are not double-audited
             ),
         )
         .await;
@@ -459,7 +460,7 @@ impl DelegateTool {
                     "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
                 )),
                 error_kind: None,
-}),
+            }),
         }
     }
 }

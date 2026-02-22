@@ -104,7 +104,7 @@ impl Tool for HardwareBoardInfoTool {
                         .into(),
                 ),
                 error_kind: None,
-});
+            });
         }
 
         let mut output = String::new();

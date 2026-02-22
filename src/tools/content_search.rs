@@ -200,7 +200,7 @@ impl Tool for ContentSearchTool {
                     "Path '{search_path}' is not allowed by security policy."
                 )),
                 error_kind: None,
-});
+            });
         }
 
         // Record action to consume rate limit budget
@@ -237,7 +237,7 @@ impl Tool for ContentSearchTool {
                     "Resolved path for '{search_path}' is outside the allowed workspace."
                 )),
                 error_kind: None,
-});
+            });
         }
 
         // --- Multiline check for grep fallback ---
@@ -249,7 +249,7 @@ impl Tool for ContentSearchTool {
                     "Multiline matching requires ripgrep (rg), which is not available.".into(),
                 ),
                 error_kind: None,
-});
+            });
         }
 
         // --- Build and execute command ---

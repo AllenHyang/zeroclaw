@@ -146,7 +146,7 @@ impl ScheduleTool {
                     "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         if !self.security.can_act() {
@@ -157,7 +157,7 @@ impl ScheduleTool {
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
                 error_kind: None,
-});
+            });
         }
 
         if !self.security.record_action() {
@@ -314,7 +314,7 @@ impl ScheduleTool {
                                 .into(),
                         ),
                         error_kind: None,
-});
+                    });
                 }
             }
         }

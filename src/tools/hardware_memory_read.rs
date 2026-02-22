@@ -89,7 +89,7 @@ impl Tool for HardwareMemoryReadTool {
                     board
                 )),
                 error_kind: None,
-});
+            });
         }
 
         let address_str = args

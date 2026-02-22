@@ -78,7 +78,7 @@ impl Tool for ShellStatusTool {
                     "Unknown action: '{action}'. Use: status, output, list, kill"
                 )),
                 error_kind: None,
-}),
+            }),
         }
     }
 }
@@ -219,7 +219,7 @@ impl ShellStatusTool {
                     status_string(&task.status)
                 )),
                 error_kind: None,
-});
+            });
         }
 
         // Send SIGTERM via the kill command.
