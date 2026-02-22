@@ -481,3 +481,51 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+## 13) Build, Deploy & Config Guardrails (Required)
+
+These rules prevent recurring deployment failures. Follow them every time.
+
+### 13.1 Config File Contract
+
+- The workspace config at `~/.zeroclaw/workspace/~/.zeroclaw/config.toml` is user-facing.
+- **Never write invalid enum values to config files.** Before modifying any config field, check the Rust enum definition for valid variants.
+- Known enum constraints (keep this list updated):
+  - `[autonomy] level`: valid values are `"readonly"`, `"supervised"`, `"full"`. There is NO `"autonomous"` variant.
+- **Always add inline comments** next to enum config fields listing valid values, e.g.: `level = "full"  # valid: "readonly", "supervised", "full"`
+- If you are unsure about a config value, read the corresponding Rust type definition before writing.
+
+### 13.2 macOS Binary Deployment
+
+After `cargo build --release`, the binary must be deployed with these steps in order:
+
+```bash
+# 1. Copy binary
+cp target/release/zeroclaw ~/.zeroclaw/bin/zeroclaw
+
+# 2. Re-sign (macOS Gatekeeper kills unsigned/quarantined binaries with SIGKILL/-9)
+codesign --force --sign - ~/.zeroclaw/bin/zeroclaw
+
+# 3. Remove quarantine attribute
+xattr -d com.apple.quarantine ~/.zeroclaw/bin/zeroclaw 2>/dev/null
+
+# 4. Restart daemon
+launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
+sleep 2
+launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
+
+# 5. Verify (PID should be positive, exit code 0)
+sleep 3
+launchctl list | grep zeroclaw
+```
+
+- **Never skip the `codesign` and `xattr` steps.** Without them the daemon will be killed immediately by Gatekeeper (exit code -9).
+- If `launchctl list` shows `-` for PID and `-9` for exit code, the binary is being killed by macOS. Re-sign and clear quarantine.
+- If `launchctl stop/start` doesn't work, use `unload/load` instead.
+- The Lark channel requires `--features channel-lark` at build time.
+
+### 13.3 Branch Hygiene During Editing
+
+- **Never switch branches while editing files.** Uncommitted changes will be lost.
+- If you need to work on a different branch, commit or stash first.
+- After creating a feature branch, merge back to the parent branch and delete the feature branch when done.
