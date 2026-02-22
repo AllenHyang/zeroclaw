@@ -38,7 +38,7 @@ pub struct Goal {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
     #[default]
@@ -47,6 +47,19 @@ pub enum GoalStatus {
     Completed,
     Blocked,
     Cancelled,
+}
+
+impl<'de> Deserialize<'de> for GoalStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "blocked" => Self::Blocked,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Pending,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -83,7 +96,7 @@ pub struct Step {
     pub attempts: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     #[default]
@@ -91,6 +104,20 @@ pub enum StepStatus {
     InProgress,
     Completed,
     Failed,
+    Blocked,
+}
+
+impl<'de> Deserialize<'de> for StepStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "blocked" => Self::Blocked,
+            _ => Self::Pending,
+        })
+    }
 }
 
 // ── GoalEngine ──────────────────────────────────────────────────
