@@ -174,7 +174,8 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Path security checks ---
-        if std::path::Path::new(search_path).is_absolute() {
+        let is_absolute = std::path::Path::new(search_path).is_absolute();
+        if is_absolute && self.security.workspace_only {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -215,7 +216,11 @@ impl Tool for ContentSearchTool {
 
         // --- Resolve search directory ---
         let workspace = &self.security.workspace_dir;
-        let resolved_path = workspace.join(search_path);
+        let resolved_path = if is_absolute {
+            std::path::PathBuf::from(search_path)
+        } else {
+            workspace.join(search_path)
+        };
 
         let resolved_canon = match std::fs::canonicalize(&resolved_path) {
             Ok(p) => p,

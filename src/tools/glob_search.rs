@@ -58,8 +58,9 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Security: reject absolute paths
-        if pattern.starts_with('/') || pattern.starts_with('\\') {
+        // Security: reject absolute paths when workspace_only is set
+        let is_absolute = pattern.starts_with('/') || pattern.starts_with('\\');
+        if is_absolute && self.security.workspace_only {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -88,9 +89,14 @@ impl Tool for GlobSearchTool {
             });
         }
 
-        // Build full pattern anchored to workspace
+        // Build full pattern: absolute patterns are used as-is,
+        // relative patterns are anchored to the workspace.
         let workspace = &self.security.workspace_dir;
-        let full_pattern = workspace.join(pattern).to_string_lossy().to_string();
+        let full_pattern = if is_absolute {
+            pattern.to_string()
+        } else {
+            workspace.join(pattern).to_string_lossy().to_string()
+        };
 
         let entries = match glob::glob(&full_pattern) {
             Ok(paths) => paths,
@@ -140,9 +146,12 @@ impl Tool for GlobSearchTool {
                 continue;
             }
 
-            // Convert to workspace-relative path
+            // Convert to workspace-relative path when inside workspace,
+            // otherwise show absolute path (when workspace_only=false).
             if let Ok(rel) = resolved.strip_prefix(&workspace_canon) {
                 results.push(rel.to_string_lossy().to_string());
+            } else if !self.security.workspace_only {
+                results.push(resolved.to_string_lossy().to_string());
             }
 
             if results.len() >= MAX_RESULTS {
