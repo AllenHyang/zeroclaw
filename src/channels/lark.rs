@@ -408,8 +408,12 @@ impl LarkChannel {
         format!("{}/auth/v3/tenant_access_token/internal", self.api_base())
     }
 
-    fn send_message_url(&self) -> String {
-        format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
+    fn send_message_url(&self, recipient: &str) -> String {
+        let id_type = lark_receive_id_type(recipient);
+        format!(
+            "{}/im/v1/messages?receive_id_type={id_type}",
+            self.api_base()
+        )
     }
 
     fn edit_message_url(&self, message_id: &str) -> String {
@@ -777,7 +781,7 @@ impl LarkChannel {
                         Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
                     };
 
-                    tracing::debug!("Lark: msg_type={}, chat_type={}, sender_type={}", recv.message.message_type, recv.message.chat_type, recv.sender.sender_type);
+                    tracing::debug!("Lark: msg_type={}, chat_type={}, sender_type={}, sender_open_id={}", recv.message.message_type, recv.message.chat_type, recv.sender.sender_type, recv.sender.sender_id.open_id.as_deref().unwrap_or(""));
 
                     if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
 
@@ -1062,7 +1066,7 @@ impl Channel for LarkChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
         let cleaned = strip_tool_blocks(&message.content);
         let post = markdown_to_lark_post(&cleaned);
@@ -1114,7 +1118,7 @@ impl Channel for LarkChannel {
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(&message.recipient);
 
         let initial_text = if message.content.is_empty() {
             "..."
@@ -1318,7 +1322,7 @@ impl LarkChannel {
         markdown_body: &str,
     ) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+        let url = self.send_message_url(recipient);
 
         let card = serde_json::json!({
             "config": { "wide_screen_mode": true },
@@ -1910,6 +1914,21 @@ fn parse_table_row(line: &str) -> Vec<String> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Markdown → Lark post (rich-text) converter
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Infer the Feishu `receive_id_type` from a recipient ID prefix.
+///  - `ou_`  → `open_id`  (user — creates/reuses a p2p chat)
+///  - `on_`  → `union_id`
+///  - `oc_`  → `chat_id`  (existing chat, p2p or group)
+///  - other  → `chat_id`  (safe default)
+fn lark_receive_id_type(recipient: &str) -> &'static str {
+    if recipient.starts_with("ou_") {
+        "open_id"
+    } else if recipient.starts_with("on_") {
+        "union_id"
+    } else {
+        "chat_id"
+    }
+}
 
 /// Strip `<tool_code>…</tool_code>` blocks (and similar tags) that models
 /// sometimes leak into their replies. These are internal tool-call artifacts
