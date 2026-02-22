@@ -3127,6 +3127,12 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Minimum interval between streaming draft edits (milliseconds).
+    #[serde(default = "default_lark_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Maximum number of draft edits per message before finalizing.
+    #[serde(default = "default_lark_max_draft_edits")]
+    pub max_draft_edits: u32,
 }
 
 impl ChannelConfig for FeishuConfig {
