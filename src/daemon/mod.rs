@@ -302,6 +302,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 }
             }
 
+            crate::health::set_component_activity("heartbeat", Some("running"));
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
             match crate::agent::run(
@@ -320,6 +321,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Ok(output) => {
                     // Success: reset failure tracking for this task
                     failure_map.remove(&task);
+                    crate::health::set_component_activity("heartbeat", None);
                     crate::health::mark_component_ok("heartbeat");
                     // Deliver to configured channel (best-effort)
                     if let (Some(ch_name), Some(target)) =
@@ -331,6 +333,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    crate::health::set_component_activity("heartbeat", None);
                     let (failures, _) = failure_map
                         .entry(task.clone())
                         .or_insert((0, Instant::now()));
@@ -563,6 +566,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
             // Run exploration
             tracing::info!("Goal loop: no active goals, triggering idle exploration");
+            crate::health::set_component_activity("goal-loop", Some("exploring"));
             let prompt = GoalEngine::build_exploration_prompt(&state);
             let temp = config.default_temperature;
 
@@ -585,6 +589,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             last_exploration = Some(tokio::time::Instant::now());
             daily_exploration_count += 1;
 
+            crate::health::set_component_activity("goal-loop", None);
             match result {
                 Ok(Ok(output)) => {
                     tracing::info!("Idle exploration completed");
@@ -616,6 +621,13 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 goal = %state.goals[gi].description,
                 "Goal loop: goal stalled, triggering reflection"
             );
+            crate::health::set_component_activity(
+                "goal-loop",
+                Some(&format!(
+                    "reflecting: {}",
+                    crate::util::truncate_with_ellipsis(&state.goals[gi].description, 60)
+                )),
+            );
             let prompt = GoalEngine::build_reflection_prompt(&state.goals[gi]);
             let temp = config.default_temperature;
 
@@ -635,6 +647,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             )
             .await;
 
+            crate::health::set_component_activity("goal-loop", None);
             match result {
                 Ok(Ok(output)) => {
                     tracing::info!(
@@ -684,6 +697,14 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             state.goals[gi].steps[si].status = StepStatus::InProgress;
             let _ = engine.save_state(&state).await;
 
+            crate::health::set_component_activity(
+                "goal-loop",
+                Some(&format!(
+                    "executing: {}",
+                    crate::util::truncate_with_ellipsis(&state.goals[gi].steps[si].description, 60)
+                )),
+            );
+
             let prompt =
                 GoalEngine::build_step_prompt(&state.goals[gi], &state.goals[gi].steps[si]);
             let temp = config.default_temperature;
@@ -704,6 +725,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             )
             .await;
 
+            crate::health::set_component_activity("goal-loop", None);
             match result {
                 Ok(Ok(output)) => {
                     let success = GoalEngine::interpret_result(&output);

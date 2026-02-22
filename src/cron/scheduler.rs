@@ -129,9 +129,20 @@ async fn execute_and_persist_job(
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
+    let job_label = job.name.as_deref().unwrap_or(&job.id);
+    crate::health::set_component_activity(
+        component,
+        Some(&format!(
+            "running: {}",
+            crate::util::truncate_with_ellipsis(job_label, 60)
+        )),
+    );
+
     let started_at = Utc::now();
     let (success, output) = execute_job_with_retry(config, security, job).await;
     let finished_at = Utc::now();
+
+    crate::health::set_component_activity(component, None);
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
     (job.id.clone(), success)
@@ -948,7 +959,9 @@ mod tests {
         let err = deliver_if_configured(&config, &job, "hello")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lark/feishu channel not configured"));
+        assert!(err
+            .to_string()
+            .contains("lark/feishu channel not configured"));
     }
 
     #[tokio::test]
@@ -965,7 +978,9 @@ mod tests {
         let err = deliver_if_configured(&config, &job, "hello")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lark/feishu channel not configured"));
+        assert!(err
+            .to_string()
+            .contains("lark/feishu channel not configured"));
     }
 
     #[test]

@@ -1482,6 +1482,9 @@ async fn process_channel_message(
         return;
     }
 
+    let health_component = format!("channel:{}", msg.channel);
+    crate::health::set_component_activity(&health_component, Some("processing"));
+
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -2084,6 +2087,8 @@ async fn process_channel_message(
             }
         }
     }
+
+    crate::health::set_component_activity(&health_component, None);
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
     if let Some(channel) = target_channel.as_ref() {

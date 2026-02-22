@@ -8,6 +8,8 @@ use std::time::Instant;
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentHealth {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     pub updated_at: String,
     pub last_ok: Option<String>,
     pub last_error: Option<String>,
@@ -50,6 +52,7 @@ where
         .entry(component.to_string())
         .or_insert_with(|| ComponentHealth {
             status: "starting".into(),
+            activity: None,
             updated_at: now.clone(),
             last_ok: None,
             last_error: None,
@@ -79,6 +82,12 @@ pub fn mark_component_error(component: &str, error: impl ToString) {
 pub fn bump_component_restart(component: &str) {
     upsert_component(component, |entry| {
         entry.restart_count = entry.restart_count.saturating_add(1);
+    });
+}
+
+pub fn set_component_activity(component: &str, activity: Option<&str>) {
+    upsert_component(component, |entry| {
+        entry.activity = activity.map(String::from);
     });
 }
 
@@ -180,5 +189,24 @@ mod tests {
         assert!(component_json["updated_at"].as_str().is_some());
         assert!(component_json["last_ok"].as_str().is_some());
         assert!(json["uptime_seconds"].as_u64().is_some());
+    }
+
+    #[test]
+    fn set_component_activity_sets_and_clears() {
+        let component = unique_component("health-activity");
+
+        mark_component_ok(&component);
+        set_component_activity(&component, Some("exploring"));
+
+        let snap = snapshot();
+        let entry = snap.components.get(&component).unwrap();
+        assert_eq!(entry.activity.as_deref(), Some("exploring"));
+
+        set_component_activity(&component, None);
+
+        let snap = snapshot();
+        let entry = snap.components.get(&component).unwrap();
+        assert!(entry.activity.is_none());
+        assert_eq!(entry.status, "ok");
     }
 }
