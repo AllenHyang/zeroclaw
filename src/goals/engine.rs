@@ -169,17 +169,14 @@ impl<'de> Deserialize<'de> for StepStatus {
     }
 }
 
-/// Truncate a string to at most `max` characters on a char boundary.
+/// Truncate a string to at most `max` **characters** on a char boundary.
 fn truncate_str(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
+    // Use char_indices to find the byte offset of the max-th character.
+    // If the string has <= max chars, return it unchanged.
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
     }
-    // Find the largest char boundary <= max
-    let mut end = max;
-    while !s.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 // ── GoalEngine ──────────────────────────────────────────────────
@@ -439,11 +436,14 @@ impl GoalEngine {
              After the status tag, optionally write a brief working memory note \
              (max ~500 chars) for your next session. This is your ONLY way to \
              pass context to yourself across sessions.\n\n\
-             Daemon restart is safe. If your task requires restarting the daemon \
-             (e.g. config changes that need reload), just do it via launchctl. \
-             The goal loop will automatically resume your goal after restart — \
-             your working_memory and goal state are persisted to disk. Do not \
-             hesitate or defer daemon restarts to the user.\n",
+             Config hot-reload: most config changes (allowlists, limits, feature flags, \
+             goal_loop params, temperature) take effect automatically — the goal loop \
+             re-reads config.toml every cycle. No restart needed.\n\n\
+             Graceful restart: if you changed channel/gateway/provider config and need a \
+             restart, write a marker file: `echo $(date) > ~/.zeroclaw/restart_requested`. \
+             The daemon detects it within 3 seconds, exits cleanly, and launchd restarts it. \
+             Your session completes normally. Do NOT use `launchctl unload` — that kills \
+             your own session mid-flight.\n",
         );
 
         prompt
@@ -2149,13 +2149,41 @@ max_steps_per_cycle = 3
     }
 
     #[test]
-    fn truncate_str_multibyte() {
-        // Each CJK char is 3 bytes
-        let s = "你好世界"; // 12 bytes
-        let t = super::truncate_str(s, 7);
-        // Should truncate to at most 7 bytes = 2 full chars (6 bytes)
-        assert_eq!(t, "你好");
-        assert!(t.len() <= 7);
+    fn truncate_str_cjk() {
+        // Each CJK char is 3 bytes — truncate by char count, not byte count
+        let s = "你好世界测试消息"; // 8 chars, 24 bytes
+        assert_eq!(super::truncate_str(s, 4), "你好世界");
+        assert_eq!(super::truncate_str(s, 2), "你好");
+        assert_eq!(super::truncate_str(s, 8), s); // exact boundary
+        assert_eq!(super::truncate_str(s, 100), s); // longer than string
+    }
+
+    #[test]
+    fn truncate_str_mixed_multibyte() {
+        // Mix of ASCII (1 byte), accented (2 bytes), CJK (3 bytes), emoji (4 bytes)
+        let s = "aé你🦀"; // 4 chars, 10 bytes
+        assert_eq!(super::truncate_str(s, 2), "aé");
+        assert_eq!(super::truncate_str(s, 3), "aé你");
+        assert_eq!(super::truncate_str(s, 4), s);
+    }
+
+    #[test]
+    fn truncate_str_emoji() {
+        let s = "😀😀😀😀"; // 4 chars, 16 bytes
+        assert_eq!(super::truncate_str(s, 2), "😀😀");
+        assert_eq!(super::truncate_str(s, 0), "");
+    }
+
+    #[test]
+    fn truncate_str_goal_status_scenario() {
+        // Simulate the real scenario that caused the panic: Chinese text with
+        // [GOAL_STATUS: blocked] tag, truncated at char boundary
+        let s = "状态已更新。\n\n---\n\n[GOAL_STATUS: blocked REASON]\n\n\
+                 **阻塞原因：安全策略限制**\n- 所有带路径参数的命令都被拦截";
+        let truncated = super::truncate_str(s, 60);
+        // Must not panic and must be valid UTF-8
+        assert!(truncated.len() <= s.len());
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     // ── build_intent_scan_prompt tests ──────────────────────────

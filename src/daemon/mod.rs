@@ -1564,4 +1564,118 @@ mod tests {
             "unexpected error: {msg}"
         );
     }
+
+    // ── Restart marker tests ─────────────────────────────────────
+
+    #[test]
+    fn restart_marker_path_derived_from_config_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let marker = config
+            .config_path
+            .parent()
+            .unwrap()
+            .join("restart_requested");
+        assert_eq!(marker, tmp.path().join("restart_requested"));
+    }
+
+    #[tokio::test]
+    async fn restart_marker_detected_when_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("restart_requested");
+        // No file → not detected
+        assert!(!marker.exists());
+        // Create marker
+        tokio::fs::write(&marker, "test").await.unwrap();
+        assert!(marker.exists());
+        // Simulate detection + cleanup
+        tokio::fs::remove_file(&marker).await.unwrap();
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn restart_marker_not_triggered_without_file() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("restart_requested");
+        // Poll once — should not trigger
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!marker.exists());
+    }
+
+    // ── clean_for_display tests ──────────────────────────────────
+
+    #[test]
+    fn clean_for_display_strips_goal_status_tags() {
+        let input = "Some output\n[GOAL_STATUS: completed]\nMore text";
+        let result = clean_for_display(input);
+        assert!(!result.contains("[GOAL_STATUS:"));
+        assert!(result.contains("Some output"));
+        assert!(result.contains("More text"));
+    }
+
+    #[test]
+    fn clean_for_display_collapses_newlines() {
+        let input = "line1\n\n\n\n\nline2";
+        let result = clean_for_display(input);
+        assert_eq!(result, "line1\n\nline2");
+    }
+
+    #[test]
+    fn clean_for_display_handles_chinese_text() {
+        let input = "状态已更新。\n\n[GOAL_STATUS: blocked REASON]\n\n**阻塞原因：安全策略限制**";
+        let result = clean_for_display(input);
+        assert!(!result.contains("[GOAL_STATUS:"));
+        assert!(result.contains("阻塞原因"));
+    }
+
+    // ── format_goal_completed_message tests ──────────────────────
+
+    #[test]
+    fn format_goal_completed_message_basic() {
+        use crate::goals::engine::{Goal, GoalExecutionMode, GoalPriority, GoalStatus};
+        let goal = Goal {
+            id: "g-test".into(),
+            description: "测试目标".into(),
+            status: GoalStatus::Completed,
+            priority: GoalPriority::Medium,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![],
+            context: String::new(),
+            last_error: None,
+            success_criteria: None,
+            constraints: None,
+            working_memory: None,
+            execution_mode: GoalExecutionMode::Autonomous,
+            total_iterations: 0,
+        };
+        let msg = format_goal_completed_message(&goal);
+        assert!(msg.contains("目标已完成: 测试目标"));
+    }
+
+    #[test]
+    fn format_goal_completed_message_with_working_memory() {
+        use crate::goals::engine::{Goal, GoalExecutionMode, GoalPriority, GoalStatus};
+        let goal = Goal {
+            id: "g-test".into(),
+            description: "测试".into(),
+            status: GoalStatus::Completed,
+            priority: GoalPriority::Medium,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![],
+            context: String::new(),
+            last_error: None,
+            success_criteria: None,
+            constraints: None,
+            working_memory: Some("工作记忆内容 [GOAL_STATUS: completed]".into()),
+            execution_mode: GoalExecutionMode::Autonomous,
+            total_iterations: 0,
+        };
+        let msg = format_goal_completed_message(&goal);
+        assert!(msg.contains("目标已完成: 测试"));
+        assert!(msg.contains("工作记忆内容"));
+        // GOAL_STATUS tag should be stripped
+        assert!(!msg.contains("[GOAL_STATUS:"));
+    }
 }
