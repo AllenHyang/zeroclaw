@@ -795,6 +795,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 daily_exploration_count += 1;
 
                 crate::health::set_component_activity("goal-loop", None);
+                let mut exploration_created_goals = false;
                 match result {
                     Ok(Ok(output)) => {
                         tracing::info!("Idle exploration completed");
@@ -820,6 +821,17 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             ),
                         )
                         .await;
+
+                        // Reload state — exploration may have created new goals
+                        if let Ok(new_state) = engine.load_state().await {
+                            state = new_state;
+                        }
+                        if has_actionable_goals(&state) {
+                            tracing::info!(
+                                "Exploration created actionable goals, executing immediately"
+                            );
+                            exploration_created_goals = true;
+                        }
                     }
                     Ok(Err(e)) => {
                         let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -849,7 +861,10 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     }
                 }
 
-                continue;
+                if !exploration_created_goals {
+                    continue;
+                }
+                // fall through to goal execution below
             }
         }
 
@@ -1677,5 +1692,61 @@ mod tests {
         assert!(msg.contains("工作记忆内容"));
         // GOAL_STATUS tag should be stripped
         assert!(!msg.contains("[GOAL_STATUS:"));
+    }
+
+    // ── has_actionable_goals tests ─────────────────────────────
+
+    #[test]
+    fn has_actionable_goals_empty_state() {
+        let state = crate::goals::engine::GoalState::default();
+        assert!(!has_actionable_goals(&state));
+    }
+
+    #[test]
+    fn has_actionable_goals_with_autonomous_in_progress() {
+        use crate::goals::engine::{Goal, GoalExecutionMode, GoalPriority, GoalState, GoalStatus};
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "Autonomous goal".into(),
+                status: GoalStatus::InProgress,
+                priority: GoalPriority::Low,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![],
+                context: String::new(),
+                last_error: None,
+                success_criteria: None,
+                constraints: None,
+                working_memory: None,
+                execution_mode: GoalExecutionMode::Autonomous,
+                total_iterations: 0,
+            }],
+        };
+        assert!(has_actionable_goals(&state));
+    }
+
+    #[test]
+    fn has_actionable_goals_only_completed() {
+        use crate::goals::engine::{Goal, GoalExecutionMode, GoalPriority, GoalState, GoalStatus};
+        let state = GoalState {
+            goals: vec![Goal {
+                id: "g1".into(),
+                description: "Done goal".into(),
+                status: GoalStatus::Completed,
+                priority: GoalPriority::Low,
+                created_at: String::new(),
+                updated_at: String::new(),
+                steps: vec![],
+                context: String::new(),
+                last_error: None,
+                success_criteria: None,
+                constraints: None,
+                working_memory: None,
+                execution_mode: GoalExecutionMode::Autonomous,
+                total_iterations: 0,
+            }],
+        };
+        assert!(!has_actionable_goals(&state));
     }
 }

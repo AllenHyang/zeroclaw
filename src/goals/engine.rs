@@ -586,68 +586,68 @@ impl GoalEngine {
 
     /// Build an exploration prompt for when no goals are active.
     ///
-    /// The agent is asked to review context, check for unfinished threads,
-    /// and optionally propose new goals with verified preconditions.
+    /// Output-oriented: the agent's primary task is to discover and create
+    /// an actionable goal. Journal writing is a fallback, not the default.
     pub fn build_exploration_prompt(state: &GoalState) -> String {
         let mut prompt = String::new();
 
         prompt.push_str(
-            "[Idle Exploration] No active goals. Review context and consider proposing new work.\n\n",
+            "[Idle Exploration] No active goals. Your task is to discover and create \
+             the next actionable goal.\n\n",
         );
 
         Self::append_goals_by_status(&mut prompt, state);
 
         prompt.push_str(
             "Instructions:\n\n\
-             == Phase 1: Recall and Reflect ==\n\
-             1. Use memory_recall with query \"exploration journal\" to retrieve your past\n\
-             \x20  exploration entries (category: exploration). Review what you explored\n\
-             \x20  before, what you found, and what directions you suggested for next time.\n\
-             2. Use memory_recall with query \"exploration scores\" to retrieve the latest\n\
-             \x20  exploration scorecard (category: exploration, key: exploration-scores-*).\n\
-             \x20  This tells you which directions scored well (continue) and which scored\n\
-             \x20  poorly (deprioritize). DO NOT repeat directions listed in\n\
-             \x20  `directions_to_deprioritize` unless you have a strong new reason.\n\
-             3. Use memory_recall with query \"consolidation\" to retrieve recent nightly\n\
-             \x20  consolidation summaries (category: core). These distill the full day's\n\
-             \x20  activity — cron results, errors, and discoveries you may have missed.\n\
-             4. Use memory_recall to review recent daily activity entries.\n\
-             5. Read SOUL.md to re-ground yourself in the user's mission areas.\n\
-             6. REFLECT on your exploration history, scores, AND consolidation learnings:\n\
-             \x20  - Am I stuck in a rut, repeating the same topics?\n\
-             \x20  - Which past explorations scored well? Why? How can I build on them?\n\
-             \x20  - Which scored poorly? Am I about to repeat a deprioritized direction?\n\
-             \x20  - Has the user's situation changed (new conversations, new priorities)?\n\
-             \x20  - What blind spots might I have? What am I NOT looking at?\n\n\
-             == Phase 2: Explore with Intent ==\n\
-             7. Based on your reflection, choose ONE direction to explore. Prefer:\n\
-             \x20  - Directions listed in `directions_to_continue` from the scorecard\n\
-             \x20  - Directions you suggested in your last journal entry\n\
-             \x20  - Consolidation learnings that suggest unfinished threads\n\
-             \x20  - Blind spots or areas you haven't covered recently\n\
-             \x20  - Follow-ups to completed goals that might have new developments\n\
-             \x20  AVOID: directions in `directions_to_deprioritize`, recent repeats.\n\
-             8. If you identify a valuable new goal:\n\
-             \x20  a. VERIFY the precondition first (e.g., check if data exists, if a\n\
-             \x20     service is reachable, if the user hasn't already addressed it)\n\
-             \x20  b. Only if preconditions hold: write it to state/goals.json with\n\
-             \x20     status \"pending\", priority \"low\", and 3-5 concrete steps\n\
-             \x20  c. Goals with priority \"low\" will be auto-approved and executed\n\
-             \x20     by the goal loop without waiting for human approval\n\
-             \x20  d. Notify the user with a brief rationale\n\n\
-             == Phase 3: Journal ==\n\
-             9. ALWAYS end by writing an exploration journal entry using memory_store.\n\
-             \x20  Use key \"exploration-journal-YYYY-MM-DD-N\" (N = sequence number today).\n\
-             \x20  Use category \"exploration\". Include:\n\
-             \x20  - What you explored and why\n\
-             \x20  - Key findings (or \"nothing notable\")\n\
-             \x20  - Self-critique: what went well, what was wasted effort\n\
-             \x20  - 2-3 specific directions for next exploration (not vague, be concrete)\n\
-             \x20  - Any shifts in your mental model of the user's priorities\n\n\
+             == Phase 1: Targeted Reconnaissance (max 3 tool calls) ==\n\
+             1. memory_recall query \"exploration journal\" — review past exploration entries.\n\
+             2. memory_recall query \"consolidation\" — retrieve recent nightly consolidation\n\
+             \x20  summaries (category: core) for errors, discoveries, unfinished threads.\n\
+             3. Read SOUL.md to re-ground yourself in the user's mission and priorities.\n\n\
+             == Phase 2: Deep Exploration (max 6 tool calls) ==\n\
+             Choose ONE direction from the four below and explore it deeply.\n\
+             Do not skim — read files, run commands, check data, verify assumptions.\n\n\
+             Direction A — Completed Goal Follow-up:\n\
+             \x20  Pick a recently completed goal. Check whether its outcome is still valid,\n\
+             \x20  whether it opened new opportunities, or whether a natural next step exists.\n\n\
+             Direction B — Implicit User Needs:\n\
+             \x20  Review recent conversations, errors, or config for pain points the user\n\
+             \x20  hasn't explicitly asked about but would benefit from being addressed.\n\n\
+             Direction C — Capability Gaps:\n\
+             \x20  Identify something the system should be able to do but currently cannot.\n\
+             \x20  Check if the infrastructure exists to implement it with a concrete goal.\n\n\
+             Direction D — External Changes:\n\
+             \x20  Check for environmental changes (new files, updated configs, service states)\n\
+             \x20  that create new work opportunities or invalidate existing assumptions.\n\n\
+             == Phase 3: Output (max 3 tool calls) ==\n\
+             Your DEFAULT output is to create a goal. Only skip goal creation if you\n\
+             genuinely found nothing actionable after thorough exploration.\n\n\
+             To create a goal:\n\
+             \x20  a. VERIFY preconditions first (data exists, service reachable, not duplicate)\n\
+             \x20  b. Write to state/goals.json with:\n\
+             \x20     - status: \"in_progress\" (so it executes immediately)\n\
+             \x20     - execution_mode: \"autonomous\" (agent drives to completion)\n\
+             \x20     - priority: \"low\" (auto-approved, no human wait)\n\
+             \x20     - 3-5 concrete, verifiable steps\n\
+             \x20     - Clear success_criteria (must be objectively checkable)\n\
+             \x20  c. Notify the user with a brief rationale\n\n\
+             Goal quality rules:\n\
+             \x20  - The goal MUST be completable and verifiable (not \"research X\" or \"learn about Y\")\n\
+             \x20  - The goal MUST NOT require user intervention or approval to proceed\n\
+             \x20  - The goal MUST NOT duplicate any existing goal (check the goal list above)\n\
+             \x20  - Each step must have a concrete action and expected outcome\n\n\
+             If you genuinely found nothing actionable:\n\
+             \x20  - Write a brief journal entry using memory_store\n\
+             \x20    (key: \"exploration-journal-YYYY-MM-DD-N\", category: \"exploration\")\n\
+             \x20  - Explain specifically WHY nothing was actionable (this is the exception,\n\
+             \x20    not the norm)\n\n\
              == Constraints ==\n\
              - Max 12 tool calls total.\n\
-             - If nothing valuable surfaces, say so briefly. Do not force a goal.\n\
-             - Quality over quantity. One deep insight beats five shallow scans.\n",
+             - Budget: 3 reconnaissance + 6 exploration + 3 output.\n\
+             - One deep investigation beats five shallow scans.\n\
+             - Do NOT create duplicate goals.\n\
+             - Do NOT create goals that need the user to provide information.\n",
         );
 
         prompt
@@ -1423,16 +1423,41 @@ target = "oc_test"
         assert!(prompt.contains("== Completed goals ==\n(none)"));
         assert!(prompt.contains("== Blocked goals ==\n(none)"));
         assert!(prompt.contains("== Pending goals (awaiting approval) ==\n(none)"));
-        // Phase 1: Recall and Reflect
+        // Phase 1: Targeted Reconnaissance
         assert!(prompt.contains("exploration journal"));
-        assert!(prompt.contains("REFLECT on your exploration history"));
-        assert!(prompt.contains("blind spots"));
-        // Phase 2: Explore with Intent
-        assert!(prompt.contains("VERIFY the precondition"));
-        // Phase 3: Journal
+        assert!(prompt.contains("SOUL.md"));
+        assert!(prompt.contains("consolidation"));
+        // Phase 2: Deep Exploration — four directions
+        assert!(prompt.contains("Direction A"));
+        assert!(prompt.contains("Direction B"));
+        assert!(prompt.contains("Direction C"));
+        assert!(prompt.contains("Direction D"));
+        // Phase 3: Output — goal creation is default
+        assert!(prompt.contains("in_progress"));
+        assert!(prompt.contains("autonomous"));
+        assert!(prompt.contains("success_criteria"));
+        assert!(prompt.contains("VERIFY preconditions"));
+        // Journal is fallback only
+        assert!(prompt.contains("genuinely found nothing actionable"));
         assert!(prompt.contains("memory_store"));
-        assert!(prompt.contains("exploration-journal-"));
-        assert!(prompt.contains("Self-critique"));
+    }
+
+    #[test]
+    fn exploration_prompt_output_oriented() {
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        // Goal creation is the DEFAULT, not optional
+        assert!(prompt.contains("Your task is to discover and create"));
+        assert!(prompt.contains("Your DEFAULT output is to create a goal"));
+        // Goal quality rules
+        assert!(prompt.contains("MUST be completable and verifiable"));
+        assert!(prompt.contains("MUST NOT require user intervention"));
+        assert!(prompt.contains("MUST NOT duplicate"));
+        // Budget allocation
+        assert!(prompt.contains("max 3 tool calls"));
+        assert!(prompt.contains("max 6 tool calls"));
+        assert!(prompt.contains("max 3 tool calls"));
+        assert!(prompt.contains("Max 12 tool calls total"));
     }
 
     #[test]
@@ -1578,16 +1603,24 @@ auto_approve_low_priority = true
     }
 
     #[test]
-    fn exploration_prompt_mentions_scorecard() {
+    fn exploration_prompt_four_directions() {
         let state = GoalState::default();
         let prompt = GoalEngine::build_exploration_prompt(&state);
         assert!(
-            prompt.contains("exploration scores"),
-            "exploration prompt should read scorecard"
+            prompt.contains("Direction A") && prompt.contains("Completed Goal Follow-up"),
+            "exploration prompt should include Direction A"
         );
         assert!(
-            prompt.contains("directions_to_deprioritize"),
-            "exploration prompt should mention deprioritize list"
+            prompt.contains("Direction B") && prompt.contains("Implicit User Needs"),
+            "exploration prompt should include Direction B"
+        );
+        assert!(
+            prompt.contains("Direction C") && prompt.contains("Capability Gaps"),
+            "exploration prompt should include Direction C"
+        );
+        assert!(
+            prompt.contains("Direction D") && prompt.contains("External Changes"),
+            "exploration prompt should include Direction D"
         );
     }
 
