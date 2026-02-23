@@ -421,6 +421,8 @@ impl GoalEngine {
         prompt.push_str(
             "== Session Instructions ==\n\
              You are running autonomously — do NOT ask the user for input.\n\n\
+             First, read SOUL.md to ground yourself in your identity and operating \
+             principles. Your behavior should follow what SOUL.md says.\n\n\
              The goal description above is your task, like a one-liner from your boss.\n\
              Figure out the intent yourself. Break it down, execute, and verify.\n\
              Don't wait for detailed specs — think like a capable employee who \
