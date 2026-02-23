@@ -417,6 +417,56 @@ fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String 
     }
 }
 
+/// Build a concise summary of active (in_progress / blocked) goals for injection
+/// into channel system prompts.  This lets the agent correlate user messages with
+/// ongoing goals and proactively update goal state when users provide corrections,
+/// new information, or feedback relevant to an existing goal.
+///
+/// The summary is intentionally compact (≤ ~1500 chars) to avoid crowding the
+/// context window.
+async fn build_active_goals_summary(workspace_dir: &Path) -> String {
+    let engine = crate::goals::engine::GoalEngine::new(workspace_dir);
+    let state = match engine.load_state().await {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    use crate::goals::engine::GoalStatus;
+
+    let active: Vec<_> = state
+        .goals
+        .iter()
+        .filter(|g| matches!(g.status, GoalStatus::InProgress | GoalStatus::Blocked))
+        .collect();
+
+    if active.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "== Active Goals (read from state/goals.json) ==\n\
+         When the user's message provides new information, corrections, or feedback \
+         that relates to one of these goals, you SHOULD proactively update the goal \
+         in state/goals.json (e.g. revise description, update working_memory, adjust \
+         steps, change status). Do NOT wait for the user to explicitly ask.\n\n",
+    );
+
+    for g in &active {
+        let status = match g.status {
+            GoalStatus::InProgress => "in_progress",
+            GoalStatus::Blocked => "blocked",
+            _ => unreachable!(),
+        };
+        let _ = writeln!(out, "- [{}] ({}) {}", g.id, status, g.description);
+        if let Some(ref wm) = g.working_memory {
+            let wm_preview = truncate_with_ellipsis(wm, 200);
+            let _ = writeln!(out, "  working_memory: {wm_preview}");
+        }
+    }
+
+    out
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -1598,7 +1648,16 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+    let mut system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
+
+    // Inject active goals summary so the agent can correlate user messages
+    // with in-progress goals and update them proactively.
+    let goals_summary = build_active_goals_summary(&ctx.workspace_dir).await;
+    if !goals_summary.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&goals_summary);
+    }
+
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
