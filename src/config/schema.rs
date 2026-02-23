@@ -2117,6 +2117,10 @@ pub struct ReliabilityConfig {
     /// Prevents 429 rate-limit storms when multiple components call the provider simultaneously.
     #[serde(default = "default_max_concurrent_llm_calls")]
     pub max_concurrent_llm_calls: usize,
+    /// Minimum interval (ms) between consecutive LLM API calls.
+    /// Prevents RPM rate-limit errors. 0 = disabled (default).
+    #[serde(default)]
+    pub min_request_interval_ms: u64,
 }
 
 fn default_provider_retries() -> u32 {
@@ -2160,6 +2164,7 @@ impl Default for ReliabilityConfig {
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
             max_concurrent_llm_calls: default_max_concurrent_llm_calls(),
+            min_request_interval_ms: 0,
         }
     }
 }
