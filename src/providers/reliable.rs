@@ -5,6 +5,7 @@ use super::Provider;
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -14,9 +15,27 @@ use std::time::Duration;
 // retries) must acquire a rate token *and* a concurrency permit.  The
 // permit is released as soon as the HTTP response completes, so backoff
 // sleeps do not waste concurrency slots.
+//
+// Channel (interactive) messages use a dedicated semaphore so they never
+// queue behind slow autonomous requests (goal-loop, cron, heartbeat).
 
 static LLM_TOKEN_BUCKET: OnceLock<Arc<TokenBucket>> = OnceLock::new();
 static LLM_CONCURRENCY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static CHANNEL_LLM_CONCURRENCY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+tokio::task_local! {
+    static IS_CHANNEL_REQUEST: bool;
+}
+
+/// Run a future within a channel-request scope.  Any LLM calls made
+/// inside `f` will acquire from the channel-reserved semaphore instead
+/// of the global autonomous pool.
+pub async fn run_in_channel_scope<F, T>(f: F) -> T
+where
+    F: Future<Output = T>,
+{
+    IS_CHANNEL_REQUEST.scope(true, f).await
+}
 
 struct TokenBucketState {
     tokens: f64,
@@ -73,14 +92,23 @@ impl TokenBucket {
 /// Initialise the global LLM rate limiter.  Call once at daemon startup
 /// before spawning any component tasks.
 ///
-/// - `max_concurrent`: maximum concurrent in-flight LLM requests.
+/// - `max_concurrent`: maximum concurrent in-flight LLM requests for
+///   autonomous components (goal-loop, cron, heartbeat).
 /// - `min_interval_ms`: minimum milliseconds between consecutive requests.
 ///   When > 0, a token bucket is created with `capacity = max_concurrent`
 ///   (burst budget) and refill rate = 1 token per `min_interval_ms`.
 ///   When 0, only the concurrency semaphore is active.
-pub fn init_llm_rate_limiter(max_concurrent: usize, min_interval_ms: u64) {
+/// - `channel_reserved`: dedicated concurrency slots for channel (interactive)
+///   messages.  When > 0, channel requests use a separate semaphore so they
+///   never queue behind autonomous calls.  When 0, channel requests share
+///   the global pool (backward compatible).
+pub fn init_llm_rate_limiter(max_concurrent: usize, min_interval_ms: u64, channel_reserved: usize) {
     let max = max_concurrent.max(1);
     LLM_CONCURRENCY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max)));
+    if channel_reserved > 0 {
+        CHANNEL_LLM_CONCURRENCY
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(channel_reserved)));
+    }
     if min_interval_ms > 0 {
         LLM_TOKEN_BUCKET.get_or_init(|| {
             Arc::new(TokenBucket::new(
@@ -101,7 +129,17 @@ async fn acquire_rate_token() {
 
 /// Acquire a concurrency permit.  Returns `None` when the semaphore has
 /// not been initialised (CLI one-shot mode).
+///
+/// When called inside a `run_in_channel_scope` future **and** a dedicated
+/// channel semaphore has been initialised, the permit is acquired from the
+/// channel pool.  Otherwise the global autonomous pool is used.
 async fn acquire_concurrency_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let is_channel = IS_CHANNEL_REQUEST.try_with(|v| *v).unwrap_or(false);
+    if is_channel {
+        if let Some(sem) = CHANNEL_LLM_CONCURRENCY.get() {
+            return Arc::clone(sem).acquire_owned().await.ok();
+        }
+    }
     if let Some(sem) = LLM_CONCURRENCY.get() {
         Arc::clone(sem).acquire_owned().await.ok()
     } else {

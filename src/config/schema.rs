@@ -2113,7 +2113,7 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
-    /// Maximum concurrent LLM calls across all daemon components (channel, goal-loop, cron, heartbeat).
+    /// Maximum concurrent LLM calls for autonomous components (goal-loop, cron, heartbeat).
     /// Prevents 429 rate-limit storms when multiple components call the provider simultaneously.
     #[serde(default = "default_max_concurrent_llm_calls")]
     pub max_concurrent_llm_calls: usize,
@@ -2121,6 +2121,13 @@ pub struct ReliabilityConfig {
     /// Prevents RPM rate-limit errors. 0 = disabled (default).
     #[serde(default)]
     pub min_request_interval_ms: u64,
+    /// Dedicated concurrency slots reserved for channel (interactive) messages.
+    /// Channel LLM calls use a separate semaphore so user messages are never
+    /// blocked behind slow autonomous requests. Total possible concurrent LLM
+    /// calls = `max_concurrent_llm_calls + channel_reserved_llm_slots`.
+    /// When 0, channel messages share the global autonomous pool (backward compatible).
+    #[serde(default = "default_channel_reserved_llm_slots")]
+    pub channel_reserved_llm_slots: usize,
 }
 
 fn default_provider_retries() -> u32 {
@@ -2151,6 +2158,10 @@ fn default_max_concurrent_llm_calls() -> usize {
     2
 }
 
+fn default_channel_reserved_llm_slots() -> usize {
+    1
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -2165,6 +2176,7 @@ impl Default for ReliabilityConfig {
             scheduler_retries: default_scheduler_retries(),
             max_concurrent_llm_calls: default_max_concurrent_llm_calls(),
             min_request_interval_ms: 0,
+            channel_reserved_llm_slots: default_channel_reserved_llm_slots(),
         }
     }
 }

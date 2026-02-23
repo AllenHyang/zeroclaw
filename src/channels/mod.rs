@@ -2215,7 +2215,12 @@ async fn run_message_dispatch_loop(
                 }
             }
 
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
+            crate::providers::reliable::run_in_channel_scope(process_channel_message(
+                worker_ctx,
+                msg,
+                cancellation_token,
+            ))
+            .await;
 
             if interrupt_enabled {
                 let mut active = in_flight.lock().await;

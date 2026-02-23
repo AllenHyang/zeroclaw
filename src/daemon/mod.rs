@@ -25,6 +25,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     crate::providers::reliable::init_llm_rate_limiter(
         config.reliability.max_concurrent_llm_calls,
         config.reliability.min_request_interval_ms,
+        config.reliability.channel_reserved_llm_slots,
     );
 
     crate::health::mark_component_ok("daemon");
