@@ -420,15 +420,20 @@ impl GoalEngine {
         // Session instructions
         prompt.push_str(
             "== Session Instructions ==\n\
-             You are running autonomously — do NOT ask the user for input.\n\
-             Work towards the goal above. Use tools as needed.\n\
+             You are running autonomously — do NOT ask the user for input.\n\n\
+             The goal description above is your task, like a one-liner from your boss.\n\
+             Figure out the intent yourself. Break it down, execute, and verify.\n\
+             Don't wait for detailed specs — think like a capable employee who \
+             receives a brief instruction and delivers a complete result.\n\n\
+             If success criteria or constraints are provided, respect them.\n\
+             If not, use your own judgment on what \"done\" looks like.\n\n\
              When you finish or need to pause, end your output with EXACTLY one of:\n\
              [GOAL_STATUS: completed]\n\
              [GOAL_STATUS: in_progress]\n\
              [GOAL_STATUS: blocked REASON]\n\n\
-             After the status tag, you may optionally write a brief working memory \
-             note (max ~500 chars) that will be preserved for your next session.\n\
-             This is your ONLY way to pass context to yourself across sessions.\n",
+             After the status tag, optionally write a brief working memory note \
+             (max ~500 chars) for your next session. This is your ONLY way to \
+             pass context to yourself across sessions.\n",
         );
 
         prompt
