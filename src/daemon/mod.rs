@@ -23,6 +23,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .max(initial_backoff);
 
     crate::providers::reliable::init_llm_concurrency(config.reliability.max_concurrent_llm_calls);
+    crate::providers::reliable::init_llm_throttle(config.reliability.min_request_interval_ms);
 
     crate::health::mark_component_ok("daemon");
 
@@ -93,6 +94,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("goal-loop");
+        crate::goals::status::set_mode("disabled");
         tracing::info!("Goal loop disabled; goal-loop supervisor not started");
     }
 
@@ -233,6 +235,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
                     "written_at".into(),
                     serde_json::json!(Utc::now().to_rfc3339()),
                 );
+                obj.insert("goal_loop".into(), crate::goals::status::snapshot_json());
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
             let _ = tokio::fs::write(&path, data).await;
@@ -357,7 +360,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     if let (Some(ch_name), Some(target)) =
                         (&config.heartbeat.channel, &config.heartbeat.target)
                     {
-                        if let Err(e) = deliver_heartbeat(&config, ch_name, target, &output).await {
+                        if let Err(e) = deliver_notification(
+                            &config,
+                            ch_name,
+                            target,
+                            "🦀 ZeroClaw 心跳报告",
+                            &output,
+                        )
+                        .await
+                        {
                             tracing::warn!("Heartbeat delivery to {ch_name} failed: {e}");
                         }
                     }
@@ -389,10 +400,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     }
 }
 
-async fn deliver_heartbeat(
+async fn deliver_notification(
     config: &Config,
     channel_name: &str,
     target: &str,
+    title: &str,
     output: &str,
 ) -> Result<()> {
     use crate::channels::{Channel, SendMessage};
@@ -403,14 +415,10 @@ async fn deliver_heartbeat(
             {
                 if let Some(fs) = config.channels_config.feishu.as_ref() {
                     let channel = crate::channels::LarkChannel::from_feishu_config(fs);
-                    channel
-                        .send_card(target, "🦀 ZeroClaw 心跳报告", output)
-                        .await?;
+                    channel.send_card(target, title, output).await?;
                 } else if let Some(lk) = config.channels_config.lark.as_ref() {
                     let channel = crate::channels::LarkChannel::from_config(lk);
-                    channel
-                        .send_card(target, "🦀 ZeroClaw 心跳报告", output)
-                        .await?;
+                    channel.send_card(target, title, output).await?;
                 } else {
                     anyhow::bail!("lark/feishu channel not configured");
                 }
@@ -567,6 +575,16 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
             Duration::from_secs(config.goal_loop.autonomous_timeout_secs.max(30));
         let max_total_iterations = config.goal_loop.max_total_goal_iterations;
         let idle_interval = Duration::from_secs(u64::from(interval_mins) * 60);
+        let explore_cooldown_secs =
+            u64::from(config.goal_loop.explore_cooldown_minutes.max(1)) * 60;
+
+        crate::goals::status::increment_cycle();
+        crate::goals::status::set_intervals(idle_interval.as_secs(), active_interval.as_secs());
+        crate::goals::status::set_exploration_config(
+            daily_exploration_count,
+            config.goal_loop.max_explorations_per_day,
+            explore_cooldown_secs,
+        );
 
         let mut state = match engine.load_state().await {
             Ok(s) => s,
@@ -610,12 +628,18 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 if let Err(e) = engine.save_state(&state).await {
                     tracing::warn!("Goal loop: failed to save state after auto-approve: {e}");
                 }
-                notify_goal_event(&config, "已自动批准待处理的低优先级目标").await;
+                notify_goal_event(
+                    &config,
+                    "🦀 ZeroClaw 目标更新",
+                    "已自动批准待处理的低优先级目标",
+                )
+                .await;
             }
         }
 
         // ── Idle: no actionable goals — run intent scan, then explore ──
         if state.goals.is_empty() || !has_actionable_goals(&state) {
+            crate::goals::status::set_mode("idle");
             if !config.goal_loop.explore_when_idle {
                 continue;
             }
@@ -665,12 +689,14 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         messages.iter().max_by(|a, b| a.timestamp.cmp(&b.timestamp))
                     {
                         last_intent_scan_ts = Some(newest.timestamp.clone());
+                        crate::goals::status::set_intent_scan_watermark(&newest.timestamp);
                     }
 
                     tracing::info!(
                         count = messages.len(),
                         "Goal loop: running intent scan on recent messages"
                     );
+                    crate::goals::status::set_mode("intent-scan");
                     crate::health::set_component_activity("goal-loop", Some("intent-scan"));
 
                     let prompt = GoalEngine::build_intent_scan_prompt(&messages, &state);
@@ -771,6 +797,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 }
 
                 tracing::info!("Goal loop: no active goals, triggering idle exploration");
+                crate::goals::status::set_mode("exploring");
                 crate::health::set_component_activity("goal-loop", Some("exploring"));
                 let prompt = GoalEngine::build_exploration_prompt(&state);
                 let temp = config.default_temperature;
@@ -795,6 +822,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
 
                 last_exploration = Some(tokio::time::Instant::now());
                 daily_exploration_count += 1;
+                crate::goals::status::mark_exploration_run();
 
                 crate::health::set_component_activity("goal-loop", None);
                 let mut exploration_created_goals = false;
@@ -814,6 +842,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         );
                         notify_goal_event(
                             &config,
+                            "🦀 ZeroClaw 探索报告",
                             &format!(
                                 "空闲探索完成\n\n{}",
                                 crate::util::truncate_with_ellipsis(
@@ -877,6 +906,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 goal = %state.goals[gi].description,
                 "Goal loop: goal stalled, triggering reflection"
             );
+            crate::goals::status::set_mode("reflecting");
             crate::health::set_component_activity(
                 "goal-loop",
                 Some(&format!(
@@ -922,6 +952,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     };
                     notify_goal_event(
                         &config,
+                        "🦀 ZeroClaw 目标反思",
                         &format!(
                             "目标反思: {}\n\n{}",
                             state
@@ -963,6 +994,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 let _ = engine.save_state(&state).await;
                 notify_goal_event(
                     &config,
+                    "🦀 ZeroClaw 目标暂停",
                     &format!(
                         "目标已暂停: '{}' 迭代次数已用尽",
                         state.goals[gi].description,
@@ -979,6 +1011,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 "Goal loop: running autonomous session"
             );
 
+            crate::goals::status::set_mode("active");
             crate::health::set_component_activity(
                 "goal-loop",
                 Some(&format!(
@@ -1070,18 +1103,22 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         use crate::memory::Memory;
                         let ts = chrono::Utc::now().to_rfc3339();
                         let milestone_key = format!("milestone-{}-{}", goal_id, ts);
-                        let milestone_content = format!("Completed: {}", state.goals[gi].description);
-                        if let Err(e) = mem.store(
-                            &milestone_key,
-                            &milestone_content,
-                            crate::memory::MemoryCategory::Custom("milestone".into()),
-                            None,
-                        ).await {
+                        let milestone_content =
+                            format!("Completed: {}", state.goals[gi].description);
+                        if let Err(e) = mem
+                            .store(
+                                &milestone_key,
+                                &milestone_content,
+                                crate::memory::MemoryCategory::Custom("milestone".into()),
+                                None,
+                            )
+                            .await
+                        {
                             tracing::warn!("Failed to record milestone: {e}");
                         }
                     }
                     let msg = format_goal_completed_message(&state.goals[gi]);
-                    notify_goal_event(&config, &msg).await;
+                    notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
                 } else {
                     let reason = state.goals[gi]
                         .last_error
@@ -1089,6 +1126,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         .unwrap_or("agent 标记为受阻");
                     notify_goal_event(
                         &config,
+                        "🦀 ZeroClaw 目标受阻",
                         &format!(
                             "目标受阻: '{}'\n原因: {}",
                             state.goals[gi].description,
@@ -1131,18 +1169,22 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                 use crate::memory::Memory;
                                 let ts = chrono::Utc::now().to_rfc3339();
                                 let milestone_key = format!("milestone-{}-{}", goal_id, ts);
-                                let milestone_content = format!("Completed: {}", state.goals[gi].description);
-                                if let Err(e) = mem.store(
-                                    &milestone_key,
-                                    &milestone_content,
-                                    crate::memory::MemoryCategory::Custom("milestone".into()),
-                                    None,
-                                ).await {
+                                let milestone_content =
+                                    format!("Completed: {}", state.goals[gi].description);
+                                if let Err(e) = mem
+                                    .store(
+                                        &milestone_key,
+                                        &milestone_content,
+                                        crate::memory::MemoryCategory::Custom("milestone".into()),
+                                        None,
+                                    )
+                                    .await
+                                {
                                     tracing::warn!("Failed to record milestone: {e}");
                                 }
                             }
                             let msg = format_goal_completed_message(&state.goals[gi]);
-                            notify_goal_event(&config, &msg).await;
+                            notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
                         }
                         crate::goals::engine::AutonomousSessionStatus::InProgress => {
                             state.goals[gi].last_error = None;
@@ -1159,6 +1201,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             let _ = engine.save_state(&state).await;
                             notify_goal_event(
                                 &config,
+                                "🦀 ZeroClaw 目标受阻",
                                 &format!(
                                     "目标受阻: '{}'\n原因: {}",
                                     state.goals[gi].description,
@@ -1222,6 +1265,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
             state.goals[gi].steps[si].status = StepStatus::InProgress;
             let _ = engine.save_state(&state).await;
 
+            crate::goals::status::set_mode("active");
             crate::health::set_component_activity(
                 "goal-loop",
                 Some(&format!(
@@ -1281,6 +1325,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             ));
                             notify_goal_event(
                                 &config,
+                                "🦀 ZeroClaw 目标受阻",
                                 &format!(
                                     "目标受阻: '{}'\n步骤 '{}' 已失败 {} 次",
                                     state.goals[gi].description,
@@ -1334,17 +1379,20 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     let ts = chrono::Utc::now().to_rfc3339();
                     let milestone_key = format!("milestone-{}-{}", state.goals[gi].id, ts);
                     let milestone_content = format!("Completed: {}", state.goals[gi].description);
-                    if let Err(e) = mem.store(
-                        &milestone_key,
-                        &milestone_content,
-                        crate::memory::MemoryCategory::Custom("milestone".into()),
-                        None,
-                    ).await {
+                    if let Err(e) = mem
+                        .store(
+                            &milestone_key,
+                            &milestone_content,
+                            crate::memory::MemoryCategory::Custom("milestone".into()),
+                            None,
+                        )
+                        .await
+                    {
                         tracing::warn!("Failed to record milestone: {e}");
                     }
                 }
                 let msg = format_goal_completed_message(&state.goals[gi]);
-                notify_goal_event(&config, &msg).await;
+                notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
                 let _ = engine.save_state(&state).await;
                 break;
             }
@@ -1353,11 +1401,14 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
         }
 
         // Dynamic interval: short delay if goals are actionable, long delay if idle
-        next_delay = if has_actionable_goals(&state) {
+        let actionable = has_actionable_goals(&state);
+        next_delay = if actionable {
             active_interval
         } else {
             idle_interval
         };
+        crate::goals::status::set_next_tick(next_delay);
+        crate::goals::status::set_mode(if actionable { "active" } else { "idle" });
     }
 }
 
@@ -1385,9 +1436,9 @@ fn clean_for_display(text: &str) -> String {
 }
 
 /// Send a goal event notification via the configured channel (best-effort).
-async fn notify_goal_event(config: &Config, message: &str) {
+async fn notify_goal_event(config: &Config, title: &str, message: &str) {
     if let (Some(ch_name), Some(target)) = (&config.goal_loop.channel, &config.goal_loop.target) {
-        if let Err(e) = deliver_heartbeat(config, ch_name, target, message).await {
+        if let Err(e) = deliver_notification(config, ch_name, target, title, message).await {
             tracing::warn!("Goal event delivery to {ch_name} failed: {e}");
         }
     } else {
@@ -1602,9 +1653,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_heartbeat_unsupported_channel_returns_error() {
+    async fn deliver_notification_unsupported_channel_returns_error() {
         let config = Config::default();
-        let err = deliver_heartbeat(&config, "carrier_pigeon", "target", "hello")
+        let err = deliver_notification(&config, "carrier_pigeon", "target", "title", "hello")
             .await
             .unwrap_err();
         assert!(err
@@ -1613,9 +1664,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_heartbeat_lark_not_configured_returns_error() {
+    async fn deliver_notification_lark_not_configured_returns_error() {
         let config = Config::default();
-        let err = deliver_heartbeat(&config, "lark", "oc_abc123", "report")
+        let err = deliver_notification(&config, "lark", "oc_abc123", "title", "report")
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -1626,9 +1677,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_heartbeat_feishu_not_configured_returns_error() {
+    async fn deliver_notification_feishu_not_configured_returns_error() {
         let config = Config::default();
-        let err = deliver_heartbeat(&config, "feishu", "oc_abc123", "report")
+        let err = deliver_notification(&config, "feishu", "oc_abc123", "title", "report")
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -1639,19 +1690,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_heartbeat_telegram_not_configured_returns_error() {
+    async fn deliver_notification_telegram_not_configured_returns_error() {
         let config = Config::default();
-        let err = deliver_heartbeat(&config, "telegram", "12345", "report")
+        let err = deliver_notification(&config, "telegram", "12345", "title", "report")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("telegram channel not configured"));
     }
 
     #[tokio::test]
-    async fn deliver_heartbeat_case_insensitive_channel_name() {
+    async fn deliver_notification_case_insensitive_channel_name() {
         let config = Config::default();
         // "LARK" should match as "lark" (case insensitive), then fail because not configured
-        let err = deliver_heartbeat(&config, "LARK", "oc_abc123", "report")
+        let err = deliver_notification(&config, "LARK", "oc_abc123", "title", "report")
             .await
             .unwrap_err();
         let msg = err.to_string();

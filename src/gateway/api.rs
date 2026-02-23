@@ -95,6 +95,7 @@ pub async fn handle_api_status(
         "paired": state.pairing.is_paired(),
         "channels": channels,
         "health": health,
+        "goal_loop": crate::goals::status::snapshot_json(),
     });
 
     Json(body).into_response()
@@ -601,10 +602,7 @@ pub async fn handle_api_dashboard(
     use crate::memory::MemoryCategory;
     let milestones: Vec<serde_json::Value> = state
         .mem
-        .list(
-            Some(&MemoryCategory::Custom("milestone".into())),
-            None,
-        )
+        .list(Some(&MemoryCategory::Custom("milestone".into())), None)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -622,6 +620,7 @@ pub async fn handle_api_dashboard(
     let body = serde_json::json!({
         "uptime_seconds": uptime_seconds,
         "goals": goals_summary,
+        "goal_loop": crate::goals::status::snapshot_json(),
         "cost": cost,
         "memory": { "total_entries": memory_count },
         "tools": { "registered": tools_count },
