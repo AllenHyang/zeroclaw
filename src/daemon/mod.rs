@@ -115,6 +115,29 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    // ── Restart marker watcher ──
+    // Agent writes `~/.zeroclaw/restart_requested` when a graceful restart is
+    // needed (e.g. channel/gateway config change). The daemon detects the file,
+    // removes it, and exits with code 0 so launchd KeepAlive restarts it.
+    {
+        let marker_path = config
+            .config_path
+            .parent()
+            .unwrap_or(&config.workspace_dir)
+            .join("restart_requested");
+        handles.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if marker_path.exists() {
+                    tracing::info!("Restart marker detected, exiting for launchd restart");
+                    let _ = tokio::fs::remove_file(&marker_path).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                }
+            }
+        }));
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, goal-loop, scheduler");
@@ -509,19 +532,12 @@ async fn check_network_reachable(config: &Config) -> bool {
     .is_ok_and(|r| r.is_ok())
 }
 
-async fn run_goal_loop_worker(config: Config) -> Result<()> {
+async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
     use crate::goals::engine::{
         GoalEngine, GoalExecutionMode, GoalPriority, GoalStatus, StepStatus,
     };
 
     let engine = GoalEngine::new(&config.workspace_dir);
-    let interval_mins = config.goal_loop.interval_minutes.max(1);
-    let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
-    let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
-    let autonomous_timeout = Duration::from_secs(config.goal_loop.autonomous_timeout_secs.max(30));
-    let max_total_iterations = config.goal_loop.max_total_goal_iterations;
-
-    let idle_interval = Duration::from_secs(u64::from(interval_mins) * 60);
     let active_interval = Duration::from_secs(5);
     let mut next_delay = Duration::ZERO; // first tick is immediate
 
@@ -536,6 +552,19 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
     loop {
         tokio::time::sleep(next_delay).await;
+
+        // ── Hot-reload config ──
+        match Config::load_or_init().await {
+            Ok(new_config) => config = new_config,
+            Err(e) => tracing::warn!("Goal loop: config reload failed, keeping previous: {e}"),
+        }
+        let interval_mins = config.goal_loop.interval_minutes.max(1);
+        let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
+        let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
+        let autonomous_timeout =
+            Duration::from_secs(config.goal_loop.autonomous_timeout_secs.max(30));
+        let max_total_iterations = config.goal_loop.max_total_goal_iterations;
+        let idle_interval = Duration::from_secs(u64::from(interval_mins) * 60);
 
         let mut state = match engine.load_state().await {
             Ok(s) => s,
