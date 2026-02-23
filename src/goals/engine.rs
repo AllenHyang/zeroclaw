@@ -429,6 +429,9 @@ impl GoalEngine {
              receives a brief instruction and delivers a complete result.\n\n\
              If success criteria or constraints are provided, respect them.\n\
              If not, use your own judgment on what \"done\" looks like.\n\n\
+             When you complete a goal and there is a clear next step, write a \
+             follow-up goal directly into state/goals.json (status: pending, \
+             priority: low). Don't leave loose ends for exploration to find later.\n\n\
              When you finish or need to pause, end your output with EXACTLY one of:\n\
              [GOAL_STATUS: completed]\n\
              [GOAL_STATUS: in_progress]\n\
