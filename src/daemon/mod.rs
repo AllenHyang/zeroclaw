@@ -572,11 +572,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 if let Err(e) = engine.save_state(&state).await {
                     tracing::warn!("Goal loop: failed to save state after auto-approve: {e}");
                 }
-                notify_goal_event(
-                    &config,
-                    "Goal loop: auto-approved pending low-priority goals",
-                )
-                .await;
+                notify_goal_event(&config, "已自动批准待处理的低优先级目标").await;
             }
         }
 
@@ -780,8 +776,11 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                         notify_goal_event(
                             &config,
                             &format!(
-                                "Idle exploration:\n{}",
-                                crate::util::truncate_with_ellipsis(&output, 300),
+                                "空闲探索完成\n\n{}",
+                                crate::util::truncate_with_ellipsis(
+                                    &clean_for_display(&output),
+                                    300,
+                                ),
                             ),
                         )
                         .await;
@@ -871,13 +870,13 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                     notify_goal_event(
                         &config,
                         &format!(
-                            "Goal reflection: {}\n{}",
+                            "目标反思: {}\n\n{}",
                             state
                                 .goals
                                 .get(gi)
                                 .map(|g| g.description.as_str())
                                 .unwrap_or("?"),
-                            crate::util::truncate_with_ellipsis(&output, 300),
+                            crate::util::truncate_with_ellipsis(&clean_for_display(&output), 300,),
                         ),
                     )
                     .await;
@@ -912,7 +911,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                 notify_goal_event(
                     &config,
                     &format!(
-                        "Goal '{}' auto-blocked: iteration budget exhausted",
+                        "目标已暂停: '{}' 迭代次数已用尽",
                         state.goals[gi].description,
                     ),
                 )
@@ -1019,12 +1018,13 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                     let reason = state.goals[gi]
                         .last_error
                         .as_deref()
-                        .unwrap_or("marked blocked by agent");
+                        .unwrap_or("agent 标记为受阻");
                     notify_goal_event(
                         &config,
                         &format!(
-                            "Goal '{}' blocked (autonomous): {reason}",
+                            "目标受阻: '{}'\n原因: {}",
                             state.goals[gi].description,
+                            clean_for_display(reason),
                         ),
                     )
                     .await;
@@ -1077,8 +1077,9 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                             notify_goal_event(
                                 &config,
                                 &format!(
-                                    "Goal '{}' blocked (autonomous): {reason}",
+                                    "目标受阻: '{}'\n原因: {}",
                                     state.goals[gi].description,
+                                    clean_for_display(&reason),
                                 ),
                             )
                             .await;
@@ -1198,7 +1199,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                             notify_goal_event(
                                 &config,
                                 &format!(
-                                    "Goal '{}' blocked: step '{}' failed {} times",
+                                    "目标受阻: '{}'\n步骤 '{}' 已失败 {} 次",
                                     state.goals[gi].description,
                                     state.goals[gi].steps[si].description,
                                     state.goals[gi].steps[si].attempts,
@@ -1257,16 +1258,25 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
 /// Build a completion notification that includes working_memory as a summary.
 fn format_goal_completed_message(goal: &crate::goals::engine::Goal) -> String {
-    let mut msg = format!("Goal completed: {}", goal.description);
+    let mut msg = format!("目标已完成: {}", goal.description);
     if let Some(ref wm) = goal.working_memory {
-        let wm = wm.trim();
-        if !wm.is_empty() {
-            let summary = crate::util::truncate_with_ellipsis(wm, 800);
+        let cleaned = clean_for_display(wm);
+        if !cleaned.is_empty() {
+            let summary = crate::util::truncate_with_ellipsis(&cleaned, 800);
             msg.push_str("\n\n");
             msg.push_str(&summary);
         }
     }
     msg
+}
+
+/// Strip `[GOAL_STATUS: ...]` markers and other internal protocol text
+/// from agent output before showing to end users.
+fn clean_for_display(text: &str) -> String {
+    let re = regex::Regex::new(r"(?s)\[GOAL_STATUS:[^\]]*\]").unwrap();
+    let cleaned = re.replace_all(text, "");
+    let collapse = regex::Regex::new(r"\n{3,}").unwrap();
+    collapse.replace_all(&cleaned, "\n\n").trim().to_string()
 }
 
 /// Send a goal event notification via the configured channel (best-effort).
