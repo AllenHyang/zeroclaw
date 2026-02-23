@@ -506,6 +506,75 @@ impl GoalEngine {
         truncate_str(output.trim(), max_chars).to_string()
     }
 
+    /// Build a prompt to scan recent chat messages for un-captured task intents.
+    ///
+    /// The LLM compares recent user messages against existing goals and creates
+    /// new goals for any task intents that have no corresponding goal.
+    pub fn build_intent_scan_prompt(
+        recent_messages: &[crate::memory::MemoryEntry],
+        state: &GoalState,
+    ) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str(
+            "[Intent Scan] Scanning recent chat messages for tasks that lack a corresponding goal.\n\n",
+        );
+
+        // Recent user messages
+        prompt.push_str("== Recent User Messages ==\n");
+        if recent_messages.is_empty() {
+            prompt.push_str("(none)\n");
+        } else {
+            for msg in recent_messages {
+                let _ = writeln!(prompt, "- [{}] {}", msg.timestamp, msg.content);
+            }
+        }
+        prompt.push('\n');
+
+        // Current goals
+        prompt.push_str("== Current Goals ==\n");
+        if state.goals.is_empty() {
+            prompt.push_str("(none)\n");
+        } else {
+            for g in &state.goals {
+                let status = match g.status {
+                    GoalStatus::Pending => "pending",
+                    GoalStatus::InProgress => "in_progress",
+                    GoalStatus::Completed => "completed",
+                    GoalStatus::Blocked => "blocked",
+                    GoalStatus::Cancelled => "cancelled",
+                };
+                let _ = writeln!(prompt, "- [{}] ({}) {}", g.id, status, g.description);
+            }
+        }
+        prompt.push('\n');
+
+        // Instructions
+        prompt.push_str(
+            "== Instructions ==\n\
+             Compare the user messages above against the current goals.\n\
+             Identify messages where the user expressed a TASK INTENT — something they \
+             want done — that does NOT have a corresponding goal (any status).\n\n\
+             Rules:\n\
+             - Casual chat, greetings, questions, acknowledgements are NOT task intents.\n\
+             - Only explicit requests to DO something count (e.g., \"help me write X\", \
+             \"deploy Y\", \"fix Z\", \"research A\").\n\
+             - If a message's intent is already covered by an existing goal (even if \
+             worded differently), do NOT create a duplicate.\n\
+             - If you find uncaptured task intents, write them to state/goals.json with:\n\
+             \x20  status: \"in_progress\", execution_mode: \"autonomous\", \
+             priority: your judgment (low/medium/high).\n\
+             \x20  Include a clear description and 2-4 concrete steps.\n\
+             - If all intents are already captured, or there are no task intents, \
+             do nothing and say so briefly.\n\n\
+             Constraints:\n\
+             - Max 3 tool calls.\n\
+             - Do NOT ask the user for clarification — infer intent from context.\n",
+        );
+
+        prompt
+    }
+
     /// Build an exploration prompt for when no goals are active.
     ///
     /// The agent is asked to review context, check for unfinished threads,
@@ -2078,5 +2147,134 @@ max_steps_per_cycle = 3
         // Should truncate to at most 7 bytes = 2 full chars (6 bytes)
         assert_eq!(t, "你好");
         assert!(t.len() <= 7);
+    }
+
+    // ── build_intent_scan_prompt tests ──────────────────────────
+
+    fn make_memory_entry(key: &str, content: &str, timestamp: &str) -> crate::memory::MemoryEntry {
+        crate::memory::MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: content.to_string(),
+            category: crate::memory::MemoryCategory::Conversation,
+            timestamp: timestamp.to_string(),
+            session_id: None,
+            score: None,
+        }
+    }
+
+    #[test]
+    fn intent_scan_prompt_with_messages_and_goals() {
+        let messages = vec![
+            make_memory_entry(
+                "feishu_1",
+                "Please deploy the service",
+                "2026-02-23T10:00:00Z",
+            ),
+            make_memory_entry("feishu_2", "Fix the login bug", "2026-02-23T10:05:00Z"),
+        ];
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g1",
+                "Fix login bug",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![],
+                "",
+                None,
+            )],
+        };
+        let prompt = GoalEngine::build_intent_scan_prompt(&messages, &state);
+
+        assert!(prompt.contains("[Intent Scan]"));
+        assert!(prompt.contains("Please deploy the service"));
+        assert!(prompt.contains("Fix the login bug"));
+        assert!(prompt.contains("Fix login bug"));
+        assert!(prompt.contains("(in_progress)"));
+        assert!(prompt.contains("Max 3 tool calls"));
+    }
+
+    #[test]
+    fn intent_scan_prompt_no_messages() {
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_intent_scan_prompt(&[], &state);
+
+        assert!(prompt.contains("[Intent Scan]"));
+        assert!(prompt.contains("== Recent User Messages ==\n(none)"));
+        assert!(prompt.contains("== Current Goals ==\n(none)"));
+    }
+
+    #[test]
+    fn intent_scan_prompt_no_goals() {
+        let messages = vec![make_memory_entry(
+            "feishu_1",
+            "Set up monitoring",
+            "2026-02-23T10:00:00Z",
+        )];
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_intent_scan_prompt(&messages, &state);
+
+        assert!(prompt.contains("Set up monitoring"));
+        assert!(prompt.contains("== Current Goals ==\n(none)"));
+    }
+
+    #[test]
+    fn intent_scan_prompt_all_statuses() {
+        let state = GoalState {
+            goals: vec![
+                make_goal(
+                    "g1",
+                    "Pending",
+                    GoalStatus::Pending,
+                    GoalPriority::Low,
+                    vec![],
+                    "",
+                    None,
+                ),
+                make_goal(
+                    "g2",
+                    "Active",
+                    GoalStatus::InProgress,
+                    GoalPriority::Medium,
+                    vec![],
+                    "",
+                    None,
+                ),
+                make_goal(
+                    "g3",
+                    "Done",
+                    GoalStatus::Completed,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                ),
+                make_goal(
+                    "g4",
+                    "Stuck",
+                    GoalStatus::Blocked,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                ),
+                make_goal(
+                    "g5",
+                    "Dropped",
+                    GoalStatus::Cancelled,
+                    GoalPriority::Low,
+                    vec![],
+                    "",
+                    None,
+                ),
+            ],
+        };
+        let prompt = GoalEngine::build_intent_scan_prompt(&[], &state);
+
+        assert!(prompt.contains("(pending)"));
+        assert!(prompt.contains("(in_progress)"));
+        assert!(prompt.contains("(completed)"));
+        assert!(prompt.contains("(blocked)"));
+        assert!(prompt.contains("(cancelled)"));
     }
 }

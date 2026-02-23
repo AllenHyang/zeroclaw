@@ -523,6 +523,10 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
+    // Intent scan state
+    let mem = crate::memory::SqliteMemory::new(&config.workspace_dir).ok(); // None if DB fails — intent scan will be skipped
+    let mut last_intent_scan_ts: Option<String> = None;
+
     // Idle exploration state
     let mut last_exploration: Option<tokio::time::Instant> = None;
     let mut daily_exploration_count: u32 = 0;
@@ -576,123 +580,242 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             }
         }
 
-        // ── Idle exploration: no actionable goals ────────────────────
+        // ── Idle: no actionable goals — run intent scan, then explore ──
         if state.goals.is_empty() || !has_actionable_goals(&state) {
             if !config.goal_loop.explore_when_idle {
                 continue;
             }
 
-            // Reset daily counter on date change
-            let today = chrono::Utc::now().date_naive();
-            if last_exploration_date != Some(today) {
-                daily_exploration_count = 0;
-                last_exploration_date = Some(today);
-            }
-
-            // Check daily cap
-            if daily_exploration_count >= config.goal_loop.max_explorations_per_day {
-                tracing::debug!("Idle exploration: daily cap reached ({daily_exploration_count})");
-                continue;
-            }
-
-            // Check cooldown
-            let cooldown = Duration::from_secs(
-                u64::from(config.goal_loop.explore_cooldown_minutes.max(1)) * 60,
-            );
-            if let Some(last) = last_exploration {
-                if last.elapsed() < cooldown {
-                    continue;
-                }
-            }
-
             // Network pre-check: skip if offline
             if !check_network_reachable(&config).await {
-                tracing::debug!("Idle exploration: network unreachable, skipping");
+                tracing::debug!("Idle: network unreachable, skipping");
                 continue;
             }
 
-            // Run exploration
-            tracing::info!("Goal loop: no active goals, triggering idle exploration");
-            crate::health::set_component_activity("goal-loop", Some("exploring"));
-            let prompt = GoalEngine::build_exploration_prompt(&state);
-            let temp = config.default_temperature;
+            // ── Intent scan (every cycle, no cooldown/cap) ──────────────
+            if let Some(ref mem) = mem {
+                'intent_scan: {
+                    use crate::memory::MemoryCategory;
 
-            let started_at = chrono::Utc::now();
-            let result = tokio::time::timeout(
-                step_timeout,
-                crate::agent::run(
-                    config.clone(),
-                    Some(prompt),
-                    None,
-                    None,
-                    temp,
-                    vec![],
-                    false,
-                    false,
-                    Some("idle-exploration"),
-                ),
-            )
-            .await;
-            let finished_at = chrono::Utc::now();
+                    let entries = match mem
+                        .recent_by_category(&MemoryCategory::Conversation, interval_mins)
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("Intent scan: failed to query recent messages: {e}");
+                            break 'intent_scan;
+                        }
+                    };
 
-            last_exploration = Some(tokio::time::Instant::now());
-            daily_exploration_count += 1;
+                    // Only user messages from Feishu, excluding already-scanned
+                    let messages: Vec<_> = entries
+                        .into_iter()
+                        .filter(|e| e.key.starts_with("feishu_"))
+                        .filter(|e| {
+                            if let Some(ref ts) = last_intent_scan_ts {
+                                e.timestamp.as_str() > ts.as_str()
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
 
-            crate::health::set_component_activity("goal-loop", None);
-            match result {
-                Ok(Ok(output)) => {
-                    tracing::info!("Idle exploration completed");
-                    crate::health::mark_component_ok("goal-loop");
-                    // Persist exploration output so consolidation can see it
-                    // via `cron_runs`. Uses a synthetic job_id.
-                    let duration_ms = (finished_at - started_at).num_milliseconds();
-                    let _ = crate::cron::record_run(
-                        &config,
-                        "__idle_exploration",
-                        started_at,
-                        finished_at,
-                        "ok",
-                        Some(&output),
-                        duration_ms,
+                    if messages.is_empty() {
+                        tracing::debug!("Intent scan: no new user messages, skipping");
+                        break 'intent_scan;
+                    }
+
+                    // Update watermark to newest message timestamp
+                    if let Some(newest) =
+                        messages.iter().max_by(|a, b| a.timestamp.cmp(&b.timestamp))
+                    {
+                        last_intent_scan_ts = Some(newest.timestamp.clone());
+                    }
+
+                    tracing::info!(
+                        count = messages.len(),
+                        "Goal loop: running intent scan on recent messages"
                     );
-                    notify_goal_event(
-                        &config,
-                        &format!(
-                            "Idle exploration:\n{}",
-                            crate::util::truncate_with_ellipsis(&output, 300),
+                    crate::health::set_component_activity("goal-loop", Some("intent-scan"));
+
+                    let prompt = GoalEngine::build_intent_scan_prompt(&messages, &state);
+                    let temp = config.default_temperature;
+                    let started_at = chrono::Utc::now();
+                    let result = tokio::time::timeout(
+                        step_timeout,
+                        crate::agent::run(
+                            config.clone(),
+                            Some(prompt),
+                            None,
+                            None,
+                            temp,
+                            vec![],
+                            false,
+                            false,
+                            Some("intent-scan"),
                         ),
                     )
                     .await;
-                }
-                Ok(Err(e)) => {
+                    let finished_at = chrono::Utc::now();
+                    crate::health::set_component_activity("goal-loop", None);
+
                     let duration_ms = (finished_at - started_at).num_milliseconds();
-                    let _ = crate::cron::record_run(
-                        &config,
-                        "__idle_exploration",
-                        started_at,
-                        finished_at,
-                        "error",
-                        Some(&e.to_string()),
-                        duration_ms,
-                    );
-                    tracing::warn!("Idle exploration failed: {e}");
-                }
-                Err(_) => {
-                    let duration_ms = (finished_at - started_at).num_milliseconds();
-                    let _ = crate::cron::record_run(
-                        &config,
-                        "__idle_exploration",
-                        started_at,
-                        finished_at,
-                        "timeout",
-                        None,
-                        duration_ms,
-                    );
-                    tracing::warn!("Idle exploration timed out");
+                    match &result {
+                        Ok(Ok(output)) => {
+                            tracing::info!("Intent scan completed");
+                            crate::health::mark_component_ok("goal-loop");
+                            let _ = crate::cron::record_run(
+                                &config,
+                                "__intent_scan",
+                                started_at,
+                                finished_at,
+                                "ok",
+                                Some(output),
+                                duration_ms,
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Intent scan failed: {e}");
+                            let _ = crate::cron::record_run(
+                                &config,
+                                "__intent_scan",
+                                started_at,
+                                finished_at,
+                                "error",
+                                Some(&e.to_string()),
+                                duration_ms,
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!("Intent scan timed out");
+                            let _ = crate::cron::record_run(
+                                &config,
+                                "__intent_scan",
+                                started_at,
+                                finished_at,
+                                "timeout",
+                                None,
+                                duration_ms,
+                            );
+                        }
+                    }
+
+                    // Reload state — agent may have created new goals
+                    if let Ok(new_state) = engine.load_state().await {
+                        state = new_state;
+                    }
                 }
             }
 
-            continue;
+            // If intent scan created actionable goals, skip exploration
+            // and fall through to goal execution
+            if has_actionable_goals(&state) {
+                // fall through — the execution code below will handle it
+            } else {
+                // ── Idle exploration (subject to cooldown/cap) ──────────
+                let today = chrono::Utc::now().date_naive();
+                if last_exploration_date != Some(today) {
+                    daily_exploration_count = 0;
+                    last_exploration_date = Some(today);
+                }
+
+                if daily_exploration_count >= config.goal_loop.max_explorations_per_day {
+                    tracing::debug!(
+                        "Idle exploration: daily cap reached ({daily_exploration_count})"
+                    );
+                    continue;
+                }
+
+                let cooldown = Duration::from_secs(
+                    u64::from(config.goal_loop.explore_cooldown_minutes.max(1)) * 60,
+                );
+                if let Some(last) = last_exploration {
+                    if last.elapsed() < cooldown {
+                        continue;
+                    }
+                }
+
+                tracing::info!("Goal loop: no active goals, triggering idle exploration");
+                crate::health::set_component_activity("goal-loop", Some("exploring"));
+                let prompt = GoalEngine::build_exploration_prompt(&state);
+                let temp = config.default_temperature;
+
+                let started_at = chrono::Utc::now();
+                let result = tokio::time::timeout(
+                    step_timeout,
+                    crate::agent::run(
+                        config.clone(),
+                        Some(prompt),
+                        None,
+                        None,
+                        temp,
+                        vec![],
+                        false,
+                        false,
+                        Some("idle-exploration"),
+                    ),
+                )
+                .await;
+                let finished_at = chrono::Utc::now();
+
+                last_exploration = Some(tokio::time::Instant::now());
+                daily_exploration_count += 1;
+
+                crate::health::set_component_activity("goal-loop", None);
+                match result {
+                    Ok(Ok(output)) => {
+                        tracing::info!("Idle exploration completed");
+                        crate::health::mark_component_ok("goal-loop");
+                        let duration_ms = (finished_at - started_at).num_milliseconds();
+                        let _ = crate::cron::record_run(
+                            &config,
+                            "__idle_exploration",
+                            started_at,
+                            finished_at,
+                            "ok",
+                            Some(&output),
+                            duration_ms,
+                        );
+                        notify_goal_event(
+                            &config,
+                            &format!(
+                                "Idle exploration:\n{}",
+                                crate::util::truncate_with_ellipsis(&output, 300),
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(Err(e)) => {
+                        let duration_ms = (finished_at - started_at).num_milliseconds();
+                        let _ = crate::cron::record_run(
+                            &config,
+                            "__idle_exploration",
+                            started_at,
+                            finished_at,
+                            "error",
+                            Some(&e.to_string()),
+                            duration_ms,
+                        );
+                        tracing::warn!("Idle exploration failed: {e}");
+                    }
+                    Err(_) => {
+                        let duration_ms = (finished_at - started_at).num_milliseconds();
+                        let _ = crate::cron::record_run(
+                            &config,
+                            "__idle_exploration",
+                            started_at,
+                            finished_at,
+                            "timeout",
+                            None,
+                            duration_ms,
+                        );
+                        tracing::warn!("Idle exploration timed out");
+                    }
+                }
+
+                continue;
+            }
         }
 
         // ── Reflection: detect stalled goals before executing steps ──
@@ -890,14 +1013,8 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
                 if agent_reconciled_status == GoalStatus::Completed {
                     crate::health::mark_component_ok("goal-loop");
-                    notify_goal_event(
-                        &config,
-                        &format!(
-                            "Goal completed (autonomous): {}",
-                            state.goals[gi].description,
-                        ),
-                    )
-                    .await;
+                    let msg = format_goal_completed_message(&state.goals[gi]);
+                    notify_goal_event(&config, &msg).await;
                 } else {
                     let reason = state.goals[gi]
                         .last_error
@@ -941,14 +1058,8 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
                             state.goals[gi].last_error = None;
                             let _ = engine.save_state(&state).await;
                             crate::health::mark_component_ok("goal-loop");
-                            notify_goal_event(
-                                &config,
-                                &format!(
-                                    "Goal completed (autonomous): {}",
-                                    state.goals[gi].description,
-                                ),
-                            )
-                            .await;
+                            let msg = format_goal_completed_message(&state.goals[gi]);
+                            notify_goal_event(&config, &msg).await;
                         }
                         crate::goals::engine::AutonomousSessionStatus::InProgress => {
                             state.goals[gi].last_error = None;
@@ -1133,11 +1244,8 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             if all_done {
                 state.goals[gi].status = GoalStatus::Completed;
                 state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
-                notify_goal_event(
-                    &config,
-                    &format!("Goal completed: {}", state.goals[gi].description),
-                )
-                .await;
+                let msg = format_goal_completed_message(&state.goals[gi]);
+                notify_goal_event(&config, &msg).await;
                 let _ = engine.save_state(&state).await;
                 break;
             }
@@ -1145,6 +1253,20 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             let _ = engine.save_state(&state).await;
         }
     }
+}
+
+/// Build a completion notification that includes working_memory as a summary.
+fn format_goal_completed_message(goal: &crate::goals::engine::Goal) -> String {
+    let mut msg = format!("Goal completed: {}", goal.description);
+    if let Some(ref wm) = goal.working_memory {
+        let wm = wm.trim();
+        if !wm.is_empty() {
+            let summary = crate::util::truncate_with_ellipsis(wm, 800);
+            msg.push_str("\n\n");
+            msg.push_str(&summary);
+        }
+    }
+    msg
 }
 
 /// Send a goal event notification via the configured channel (best-effort).

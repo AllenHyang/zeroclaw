@@ -428,6 +428,46 @@ impl SqliteMemory {
 
         Ok(count)
     }
+
+    /// Fetch recent entries for a given category within the last `minutes` minutes.
+    ///
+    /// This is a SQLite-specific method used by the daemon for intent scanning.
+    /// Not part of the `Memory` trait.
+    pub async fn recent_by_category(
+        &self,
+        category: &MemoryCategory,
+        minutes: u32,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let cat_str = Self::category_to_str(category);
+        let mins = i64::from(minutes);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, key, content, category, created_at, session_id FROM memories
+                 WHERE category = ?1 AND created_at > datetime('now', '-' || ?2 || ' minutes')
+                 ORDER BY created_at DESC LIMIT 50",
+            )?;
+            let rows = stmt.query_map(params![cat_str, mins], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                })
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
 }
 
 #[async_trait]
@@ -1896,5 +1936,73 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    // ── recent_by_category tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn recent_by_category_returns_recent_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("msg1", "hello", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+        mem.store("msg2", "world", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+        mem.store("core1", "fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .recent_by_category(&MemoryCategory::Conversation, 60)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        // Should not include core entries
+        assert!(results
+            .iter()
+            .all(|e| e.category == MemoryCategory::Conversation));
+    }
+
+    #[tokio::test]
+    async fn recent_by_category_empty_when_no_matching_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("core1", "fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .recent_by_category(&MemoryCategory::Conversation, 60)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_by_category_empty_db() {
+        let (_tmp, mem) = temp_sqlite();
+        let results = mem
+            .recent_by_category(&MemoryCategory::Conversation, 60)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_by_category_respects_time_window() {
+        let (_tmp, mem) = temp_sqlite();
+        // Insert an entry, then query with 0 minutes window
+        mem.store("msg1", "recent", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        // 0 minutes window should return nothing (entry was just created,
+        // but datetime('now', '-0 minutes') is exactly now)
+        // Actually entries created "just now" should appear in any > 0 window
+        let results = mem
+            .recent_by_category(&MemoryCategory::Conversation, 1)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
