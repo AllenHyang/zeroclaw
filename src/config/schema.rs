@@ -3688,6 +3688,21 @@ async fn load_persisted_workspace_dirs(
     } else {
         default_config_dir.join(parsed_dir)
     };
+
+    // Guard: reject temp-directory paths at read time too.
+    // This prevents stale markers (left by crashed tests or old runs)
+    // from hijacking the daemon's config resolution.
+    #[cfg(not(test))]
+    if is_temp_directory(&config_dir) {
+        tracing::warn!(
+            path = %config_dir.display(),
+            "Ignoring active workspace marker pointing to temp directory; \
+             removing stale marker"
+        );
+        let _ = fs::remove_file(&state_path).await;
+        return Ok(None);
+    }
+
     Ok(Some((config_dir.clone(), config_dir.join("workspace"))))
 }
 
