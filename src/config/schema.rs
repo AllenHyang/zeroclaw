@@ -2396,6 +2396,20 @@ pub struct GoalLoopConfig {
     /// When exceeded the goal is auto-blocked. Default: `200`.
     #[serde(default = "default_max_total_goal_iterations")]
     pub max_total_goal_iterations: u32,
+
+    /// Require step-0 understanding confirmation before executing auto-approved goals.
+    /// When enabled, goals go through AwaitingConfirmation before InProgress.
+    /// Default: `false`.
+    #[serde(default)]
+    pub require_confirmation: bool,
+
+    /// Timeout in minutes for awaiting user confirmation. Default: `60`.
+    #[serde(default = "default_confirmation_timeout_minutes")]
+    pub confirmation_timeout_minutes: u32,
+
+    /// Action when confirmation times out: `"block"` or `"auto_approve"`. Default: `"block"`.
+    #[serde(default = "default_confirmation_timeout_action")]
+    pub confirmation_timeout_action: String,
 }
 
 fn default_explore_cooldown_minutes() -> u32 {
@@ -2418,6 +2432,14 @@ fn default_max_total_goal_iterations() -> u32 {
     200
 }
 
+fn default_confirmation_timeout_minutes() -> u32 {
+    60
+}
+
+fn default_confirmation_timeout_action() -> String {
+    "block".into()
+}
+
 impl Default for GoalLoopConfig {
     fn default() -> Self {
         Self {
@@ -2435,6 +2457,9 @@ impl Default for GoalLoopConfig {
             default_execution_mode: default_execution_mode(),
             autonomous_timeout_secs: default_autonomous_timeout_secs(),
             max_total_goal_iterations: default_max_total_goal_iterations(),
+            require_confirmation: false,
+            confirmation_timeout_minutes: default_confirmation_timeout_minutes(),
+            confirmation_timeout_action: default_confirmation_timeout_action(),
         }
     }
 }

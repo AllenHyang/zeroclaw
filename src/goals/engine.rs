@@ -59,6 +59,17 @@ pub struct Goal {
     /// Total tool iterations consumed across all autonomous sessions.
     #[serde(default)]
     pub total_iterations: u32,
+
+    // ── Step-0 confirmation fields ──────────────────────────────
+    /// Agent-generated understanding + execution plan (set during AwaitingConfirmation).
+    #[serde(default)]
+    pub confirmation_plan: Option<String>,
+    /// Timestamp (RFC 3339) when the confirmation was requested.
+    #[serde(default)]
+    pub confirmation_requested_at: Option<String>,
+    /// User feedback when rejecting a confirmation (triggers re-generation).
+    #[serde(default)]
+    pub confirmation_feedback: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -66,6 +77,7 @@ pub struct Goal {
 pub enum GoalStatus {
     #[default]
     Pending,
+    AwaitingConfirmation,
     InProgress,
     Completed,
     Blocked,
@@ -76,6 +88,7 @@ impl<'de> Deserialize<'de> for GoalStatus {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Ok(match s.as_str() {
+            "awaiting_confirmation" => Self::AwaitingConfirmation,
             "in_progress" => Self::InProgress,
             "completed" => Self::Completed,
             "blocked" => Self::Blocked,
@@ -548,6 +561,7 @@ impl GoalEngine {
             for g in &state.goals {
                 let status = match g.status {
                     GoalStatus::Pending => "pending",
+                    GoalStatus::AwaitingConfirmation => "awaiting_confirmation",
                     GoalStatus::InProgress => "in_progress",
                     GoalStatus::Completed => "completed",
                     GoalStatus::Blocked => "blocked",
@@ -579,6 +593,70 @@ impl GoalEngine {
              Constraints:\n\
              - Max 3 tool calls.\n\
              - Do NOT ask the user for clarification — infer intent from context.\n",
+        );
+
+        prompt
+    }
+
+    /// Build a lightweight prompt for step-0 understanding confirmation.
+    ///
+    /// The agent outputs its understanding of the goal + a 3-5 step execution plan.
+    /// If the user previously rejected and provided feedback, that feedback is
+    /// included so the agent can correct its understanding.
+    pub fn build_understanding_prompt(goal: &Goal, state: &GoalState) -> String {
+        let mut prompt = String::new();
+
+        let _ = writeln!(
+            prompt,
+            "[Understanding Confirmation] Goal: {}\n",
+            goal.description
+        );
+
+        // Success criteria
+        if let Some(ref criteria) = goal.success_criteria {
+            let _ = writeln!(prompt, "== Success Criteria ==\n{criteria}\n");
+        }
+
+        // Constraints
+        if let Some(ref constraints) = goal.constraints {
+            let _ = writeln!(prompt, "== Constraints ==\n{constraints}\n");
+        }
+
+        // User feedback from previous rejection
+        if let Some(ref feedback) = goal.confirmation_feedback {
+            let _ = writeln!(
+                prompt,
+                "== User Feedback (your previous understanding was REJECTED) ==\n\
+                 The user rejected your previous plan with this feedback:\n\
+                 \"{feedback}\"\n\n\
+                 You MUST incorporate this feedback into your revised understanding.\n"
+            );
+        }
+
+        // Goal panorama
+        Self::append_goals_by_status(&mut prompt, state);
+
+        // Instructions
+        prompt.push_str(
+            "== Instructions ==\n\
+             Before executing this goal, you must first confirm your understanding.\n\
+             Output a structured plan in the following format:\n\n\
+             **My Understanding:**\n\
+             (1-2 sentences explaining what you think the user wants)\n\n\
+             **Execution Plan:**\n\
+             1. (step 1)\n\
+             2. (step 2)\n\
+             3. (step 3)\n\
+             (3-5 concrete steps)\n\n\
+             **Expected Output:**\n\
+             (what the user will get when this goal is done)\n\n\
+             **Assumptions & Risks:**\n\
+             (anything you're unsure about or potential blockers)\n\n\
+             == Constraints ==\n\
+             - Max 3 tool calls (for reading context only).\n\
+             - Do NOT start executing the goal.\n\
+             - Do NOT modify any files or state.\n\
+             - Focus on producing a clear, accurate understanding.\n",
         );
 
         prompt
@@ -689,9 +767,22 @@ impl GoalEngine {
         }
         buf.push('\n');
 
-        buf.push_str(
-            "== Pending goals (awaiting approval — NOT being executed) ==\n",
-        );
+        buf.push_str("== Awaiting confirmation (plan generated, waiting for user approval) ==\n");
+        let awaiting: Vec<&Goal> = state
+            .goals
+            .iter()
+            .filter(|g| g.status == GoalStatus::AwaitingConfirmation)
+            .collect();
+        if awaiting.is_empty() {
+            buf.push_str("(none)\n");
+        } else {
+            for g in &awaiting {
+                let _ = writeln!(buf, "- {} [WAITING: confirmation pending]", g.description);
+            }
+        }
+        buf.push('\n');
+
+        buf.push_str("== Pending goals (awaiting approval — NOT being executed) ==\n");
         let pending: Vec<&Goal> = state
             .goals
             .iter()
@@ -701,7 +792,11 @@ impl GoalEngine {
             buf.push_str("(none)\n");
         } else {
             for g in &pending {
-                let _ = writeln!(buf, "- {} [STALLED: waiting for human approval]", g.description);
+                let _ = writeln!(
+                    buf,
+                    "- {} [STALLED: waiting for human approval]",
+                    g.description
+                );
             }
             buf.push_str(
                 "NOTE: Pending goals are NOT running and may never be approved. \
@@ -813,6 +908,9 @@ mod tests {
             working_memory: None,
             execution_mode: GoalExecutionMode::Stepped,
             total_iterations: 0,
+            confirmation_plan: None,
+            confirmation_requested_at: None,
+            confirmation_feedback: None,
         }
     }
 
@@ -846,6 +944,9 @@ mod tests {
             working_memory: working_memory.map(String::from),
             execution_mode: GoalExecutionMode::Autonomous,
             total_iterations,
+            confirmation_plan: None,
+            confirmation_requested_at: None,
+            confirmation_feedback: None,
         }
     }
 
@@ -1158,6 +1259,10 @@ target = "oc_test"
     fn goal_status_deserializes_all_valid_variants() {
         let cases = vec![
             ("\"pending\"", GoalStatus::Pending),
+            (
+                "\"awaiting_confirmation\"",
+                GoalStatus::AwaitingConfirmation,
+            ),
             ("\"in_progress\"", GoalStatus::InProgress),
             ("\"completed\"", GoalStatus::Completed),
             ("\"blocked\"", GoalStatus::Blocked),
@@ -1432,7 +1537,8 @@ target = "oc_test"
         assert!(prompt.contains("[Idle Exploration]"));
         assert!(prompt.contains("== Completed goals ==\n(none)"));
         assert!(prompt.contains("== Blocked goals ==\n(none)"));
-        assert!(prompt.contains("== Pending goals (awaiting approval) ==\n(none)"));
+        assert!(prompt.contains("== Awaiting confirmation"));
+        assert!(prompt.contains("== Pending goals (awaiting approval"));
         // Phase 1: Targeted Reconnaissance
         assert!(prompt.contains("exploration journal"));
         assert!(prompt.contains("SOUL.md"));
@@ -2347,14 +2453,173 @@ max_steps_per_cycle = 3
                     "",
                     None,
                 ),
+                make_goal(
+                    "g6",
+                    "Awaiting",
+                    GoalStatus::AwaitingConfirmation,
+                    GoalPriority::Medium,
+                    vec![],
+                    "",
+                    None,
+                ),
             ],
         };
         let prompt = GoalEngine::build_intent_scan_prompt(&[], &state);
 
         assert!(prompt.contains("(pending)"));
+        assert!(prompt.contains("(awaiting_confirmation)"));
         assert!(prompt.contains("(in_progress)"));
         assert!(prompt.contains("(completed)"));
         assert!(prompt.contains("(blocked)"));
         assert!(prompt.contains("(cancelled)"));
+    }
+
+    // ── AwaitingConfirmation serde tests ─────────────────────────
+
+    #[test]
+    fn goal_status_awaiting_confirmation_serde_roundtrip() {
+        let status = GoalStatus::AwaitingConfirmation;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"awaiting_confirmation\"");
+        let parsed: GoalStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, GoalStatus::AwaitingConfirmation);
+    }
+
+    #[test]
+    fn goal_with_confirmation_fields_roundtrip() {
+        let mut goal = make_goal(
+            "g1",
+            "Test confirmation",
+            GoalStatus::AwaitingConfirmation,
+            GoalPriority::High,
+            vec![Step {
+                id: "s1".into(),
+                description: "Do thing".into(),
+                status: StepStatus::Pending,
+                result: None,
+                attempts: 0,
+            }],
+            "",
+            None,
+        );
+        goal.confirmation_plan = Some("I understand you want X. Plan: 1,2,3".into());
+        goal.confirmation_requested_at = Some("2026-02-23T10:00:00Z".into());
+        goal.confirmation_feedback = None;
+
+        let json = serde_json::to_string_pretty(&goal).unwrap();
+        let parsed: Goal = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.status, GoalStatus::AwaitingConfirmation);
+        assert_eq!(
+            parsed.confirmation_plan.as_deref(),
+            Some("I understand you want X. Plan: 1,2,3")
+        );
+        assert_eq!(
+            parsed.confirmation_requested_at.as_deref(),
+            Some("2026-02-23T10:00:00Z")
+        );
+        assert!(parsed.confirmation_feedback.is_none());
+    }
+
+    #[test]
+    fn goal_backward_compat_no_confirmation_fields() {
+        let json = r#"{
+            "id": "g1",
+            "description": "Legacy goal",
+            "status": "in_progress",
+            "steps": []
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert!(goal.confirmation_plan.is_none());
+        assert!(goal.confirmation_requested_at.is_none());
+        assert!(goal.confirmation_feedback.is_none());
+    }
+
+    // ── build_understanding_prompt tests ─────────────────────────
+
+    #[test]
+    fn understanding_prompt_basic() {
+        let goal = make_goal(
+            "g1",
+            "Build a secure skill downloader",
+            GoalStatus::AwaitingConfirmation,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_understanding_prompt(&goal, &state);
+        assert!(prompt.contains("[Understanding Confirmation]"));
+        assert!(prompt.contains("Build a secure skill downloader"));
+        assert!(prompt.contains("My Understanding"));
+        assert!(prompt.contains("Execution Plan"));
+        assert!(prompt.contains("Expected Output"));
+        assert!(prompt.contains("Assumptions & Risks"));
+        assert!(prompt.contains("Max 3 tool calls"));
+        assert!(prompt.contains("Do NOT start executing"));
+    }
+
+    #[test]
+    fn understanding_prompt_with_feedback() {
+        let mut goal = make_goal(
+            "g1",
+            "Build a skill downloader",
+            GoalStatus::AwaitingConfirmation,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+        );
+        goal.confirmation_feedback =
+            Some("I want a NEW tool, not an audit of existing code".into());
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_understanding_prompt(&goal, &state);
+        assert!(prompt.contains("User Feedback"));
+        assert!(prompt.contains("REJECTED"));
+        assert!(prompt.contains("I want a NEW tool, not an audit"));
+    }
+
+    #[test]
+    fn understanding_prompt_with_criteria_and_constraints() {
+        let mut goal = make_goal(
+            "g1",
+            "Build feature",
+            GoalStatus::AwaitingConfirmation,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+        );
+        goal.success_criteria = Some("all tests pass".into());
+        goal.constraints = Some("no new dependencies".into());
+        let state = GoalState::default();
+        let prompt = GoalEngine::build_understanding_prompt(&goal, &state);
+        assert!(prompt.contains("== Success Criteria =="));
+        assert!(prompt.contains("all tests pass"));
+        assert!(prompt.contains("== Constraints =="));
+        assert!(prompt.contains("no new dependencies"));
+    }
+
+    // ── append_goals_by_status includes awaiting_confirmation ────
+
+    #[test]
+    fn exploration_prompt_shows_awaiting_confirmation_goals() {
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g1",
+                "Awaiting goal",
+                GoalStatus::AwaitingConfirmation,
+                GoalPriority::High,
+                vec![],
+                "",
+                None,
+            )],
+        };
+        let prompt = GoalEngine::build_exploration_prompt(&state);
+        assert!(prompt.contains("Awaiting goal [WAITING: confirmation pending]"));
     }
 }

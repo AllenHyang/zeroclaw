@@ -501,12 +501,17 @@ async fn deliver_notification(
 // ── Goal Loop Worker ─────────────────────────────────────────────
 
 /// Returns `true` if the state has goals that the loop can act on
-/// (autonomous goals, stepped goals with actionable steps, or stalled goals).
+/// (autonomous goals, stepped goals with actionable steps, stalled goals,
+/// or AwaitingConfirmation goals that need plan generation).
 fn has_actionable_goals(state: &crate::goals::engine::GoalState) -> bool {
-    use crate::goals::engine::GoalEngine;
+    use crate::goals::engine::{GoalEngine, GoalStatus};
     GoalEngine::select_next_autonomous_goal(state).is_some()
         || GoalEngine::select_next_actionable(state).is_some()
         || !GoalEngine::find_stalled_goals(state).is_empty()
+        || state
+            .goals
+            .iter()
+            .any(|g| g.status == GoalStatus::AwaitingConfirmation && g.confirmation_plan.is_none())
 }
 
 /// Lightweight network reachability check (TCP connect with 5s timeout).
@@ -612,6 +617,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
         {
             let approve_all = config.goal_loop.auto_approve_all;
             let approve_low = config.goal_loop.auto_approve_low_priority;
+            let require_confirmation = config.goal_loop.require_confirmation;
 
             if approve_all || approve_low {
                 let mut promoted = false;
@@ -625,31 +631,292 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         continue;
                     }
                     if approve_all || (approve_low && goal.priority == GoalPriority::Low) {
-                        goal.status = GoalStatus::InProgress;
-                        goal.execution_mode = mode.clone();
-                        goal.updated_at = chrono::Utc::now().to_rfc3339();
-                        tracing::info!(
-                            goal_id = %goal.id,
-                            goal = %goal.description,
-                            priority = ?goal.priority,
-                            mode = ?mode,
-                            "Goal loop: auto-approved pending goal"
-                        );
+                        if require_confirmation {
+                            goal.status = GoalStatus::AwaitingConfirmation;
+                            goal.execution_mode = mode.clone();
+                            goal.updated_at = chrono::Utc::now().to_rfc3339();
+                            tracing::info!(
+                                goal_id = %goal.id,
+                                goal = %goal.description,
+                                priority = ?goal.priority,
+                                "Goal loop: goal awaiting confirmation"
+                            );
+                        } else {
+                            goal.status = GoalStatus::InProgress;
+                            goal.execution_mode = mode.clone();
+                            goal.updated_at = chrono::Utc::now().to_rfc3339();
+                            tracing::info!(
+                                goal_id = %goal.id,
+                                goal = %goal.description,
+                                priority = ?goal.priority,
+                                mode = ?mode,
+                                "Goal loop: auto-approved pending goal"
+                            );
+                        }
                         promoted = true;
                     }
                 }
                 if promoted {
                     if let Err(e) = engine.save_state(&state).await {
+                        tracing::warn!("Goal loop: failed to save state after auto-approve: {e}");
+                    }
+                    let msg = if require_confirmation {
+                        "目标已进入确认阶段，等待生成理解计划"
+                    } else {
+                        "已自动批准待处理目标"
+                    };
+                    notify_goal_event(&config, "🦀 ZeroClaw 目标更新", msg).await;
+                }
+            }
+        }
+
+        // ── Confirmation: generate understanding plans for AwaitingConfirmation goals ──
+        {
+            let needs_plan: Vec<usize> = state
+                .goals
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| {
+                    g.status == GoalStatus::AwaitingConfirmation && g.confirmation_plan.is_none()
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            for gi in needs_plan {
+                tracing::info!(
+                    goal_id = %state.goals[gi].id,
+                    goal = %state.goals[gi].description,
+                    "Goal loop: generating understanding plan"
+                );
+                crate::goals::status::set_mode("confirming");
+                crate::health::set_component_activity(
+                    "goal-loop",
+                    Some(&format!(
+                        "confirming: {}",
+                        crate::util::truncate_with_ellipsis(&state.goals[gi].description, 60)
+                    )),
+                );
+
+                let prompt = GoalEngine::build_understanding_prompt(&state.goals[gi], &state);
+                let temp = config.default_temperature;
+                let result = tokio::time::timeout(
+                    step_timeout,
+                    crate::agent::run(
+                        config.clone(),
+                        Some(prompt),
+                        None,
+                        None,
+                        temp,
+                        vec![],
+                        false,
+                        false, // no state reconciliation — read-only
+                        Some("goal-confirmation"),
+                    ),
+                )
+                .await;
+
+                crate::health::set_component_activity("goal-loop", None);
+                match result {
+                    Ok(Ok(output)) => {
+                        state.goals[gi].confirmation_plan = Some(output.clone());
+                        state.goals[gi].confirmation_requested_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                        let _ = engine.save_state(&state).await;
+                        crate::health::mark_component_ok("goal-loop");
+
+                        // Notify user via channel
+                        notify_goal_event(
+                            &config,
+                            "🦀 ZeroClaw 理解确认",
+                            &format!(
+                                "目标: {}\n\n{}\n\n回复 \"approved\" 批准执行，或提供修改意见。",
+                                state.goals[gi].description,
+                                crate::util::truncate_with_ellipsis(
+                                    &clean_for_display(&output),
+                                    800,
+                                ),
+                            ),
+                        )
+                        .await;
+                    }
+                    Ok(Err(e)) => {
                         tracing::warn!(
-                            "Goal loop: failed to save state after auto-approve: {e}"
+                            "Understanding plan generation failed for goal {}: {e}",
+                            state.goals[gi].id,
+                        );
+                        // Don't change status — will retry next cycle
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Understanding plan generation timed out for goal {}",
+                            state.goals[gi].id,
                         );
                     }
+                }
+            }
+        }
+
+        // ── Confirmation timeout check ──────────────────────────────
+        {
+            let timeout_mins = config.goal_loop.confirmation_timeout_minutes.max(1);
+            let timeout_action = config.goal_loop.confirmation_timeout_action.clone();
+
+            let timed_out: Vec<usize> = state
+                .goals
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| {
+                    g.status == GoalStatus::AwaitingConfirmation && g.confirmation_plan.is_some()
+                })
+                .filter(|(_, g)| {
+                    if let Some(ref ts) = g.confirmation_requested_at {
+                        if let Ok(requested) = chrono::DateTime::parse_from_rfc3339(ts) {
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(requested)
+                                .num_minutes();
+                            elapsed >= i64::from(timeout_mins)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            let had_timeouts = !timed_out.is_empty();
+            for gi in timed_out {
+                if timeout_action == "auto_approve" {
+                    state.goals[gi].status = GoalStatus::InProgress;
+                    state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                    tracing::info!(
+                        goal_id = %state.goals[gi].id,
+                        "Confirmation timed out — auto-approving"
+                    );
                     notify_goal_event(
                         &config,
-                        "🦀 ZeroClaw 目标更新",
-                        "已自动批准待处理目标",
+                        "🦀 ZeroClaw 确认超时",
+                        &format!(
+                            "目标 '{}' 确认超时，自动批准执行",
+                            state.goals[gi].description,
+                        ),
                     )
                     .await;
+                } else {
+                    state.goals[gi].status = GoalStatus::Blocked;
+                    state.goals[gi].last_error =
+                        Some("confirmation timed out — awaiting user input".into());
+                    state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                    tracing::info!(
+                        goal_id = %state.goals[gi].id,
+                        "Confirmation timed out — blocking"
+                    );
+                    notify_goal_event(
+                        &config,
+                        "🦀 ZeroClaw 确认超时",
+                        &format!(
+                            "目标 '{}' 确认超时，已阻塞等待用户输入",
+                            state.goals[gi].description,
+                        ),
+                    )
+                    .await;
+                }
+            }
+
+            if had_timeouts {
+                let _ = engine.save_state(&state).await;
+            }
+        }
+
+        // ── Channel reply detection for confirmations ────────────────
+        if config.goal_loop.require_confirmation {
+            if let Some(ref mem) = mem {
+                'confirmation_scan: {
+                    use crate::memory::MemoryCategory;
+
+                    let entries = match mem
+                        .recent_by_category(&MemoryCategory::Conversation, 5) // last 5 min
+                        .await
+                    {
+                        Ok(e) => e,
+                        Err(_) => break 'confirmation_scan,
+                    };
+
+                    let user_messages: Vec<_> = entries
+                        .into_iter()
+                        .filter(|e| e.key.starts_with("feishu_"))
+                        .collect();
+
+                    // Check for approval keywords
+                    let awaiting_goals: Vec<usize> = state
+                        .goals
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| {
+                            g.status == GoalStatus::AwaitingConfirmation
+                                && g.confirmation_plan.is_some()
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+
+                    if !awaiting_goals.is_empty() {
+                        for msg in &user_messages {
+                            let content = msg.content.trim().to_ascii_lowercase();
+                            let is_approval = content == "approved"
+                                || content == "approve"
+                                || content == "ok"
+                                || content == "批准"
+                                || content == "确认"
+                                || content == "同意"
+                                || content == "lgtm";
+
+                            if is_approval {
+                                // Approve the first awaiting goal
+                                if let Some(&gi) = awaiting_goals.first() {
+                                    state.goals[gi].status = GoalStatus::InProgress;
+                                    state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                                    let _ = engine.save_state(&state).await;
+                                    tracing::info!(
+                                        goal_id = %state.goals[gi].id,
+                                        "User approved confirmation via channel"
+                                    );
+                                    notify_goal_event(
+                                        &config,
+                                        "🦀 ZeroClaw 确认通过",
+                                        &format!(
+                                            "目标 '{}' 已确认，开始执行",
+                                            state.goals[gi].description,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            } else if !content.is_empty() && content.len() > 3 {
+                                // Treat as feedback — reject and request re-generation
+                                if let Some(&gi) = awaiting_goals.first() {
+                                    state.goals[gi].confirmation_plan = None;
+                                    state.goals[gi].confirmation_requested_at = None;
+                                    state.goals[gi].confirmation_feedback =
+                                        Some(msg.content.clone());
+                                    state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                                    let _ = engine.save_state(&state).await;
+                                    tracing::info!(
+                                        goal_id = %state.goals[gi].id,
+                                        "User rejected confirmation with feedback via channel"
+                                    );
+                                    notify_goal_event(
+                                        &config,
+                                        "🦀 ZeroClaw 确认已拒绝",
+                                        &format!(
+                                            "目标 '{}' 的理解已被拒绝，将根据反馈重新生成",
+                                            state.goals[gi].description,
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1812,6 +2079,9 @@ mod tests {
             working_memory: None,
             execution_mode: GoalExecutionMode::Autonomous,
             total_iterations: 0,
+            confirmation_plan: None,
+            confirmation_requested_at: None,
+            confirmation_feedback: None,
         };
         let msg = format_goal_completed_message(&goal);
         assert!(msg.contains("目标已完成: 测试目标"));
@@ -1835,6 +2105,9 @@ mod tests {
             working_memory: Some("工作记忆内容 [GOAL_STATUS: completed]".into()),
             execution_mode: GoalExecutionMode::Autonomous,
             total_iterations: 0,
+            confirmation_plan: None,
+            confirmation_requested_at: None,
+            confirmation_feedback: None,
         };
         let msg = format_goal_completed_message(&goal);
         assert!(msg.contains("目标已完成: 测试"));
@@ -1870,6 +2143,9 @@ mod tests {
                 working_memory: None,
                 execution_mode: GoalExecutionMode::Autonomous,
                 total_iterations: 0,
+                confirmation_plan: None,
+                confirmation_requested_at: None,
+                confirmation_feedback: None,
             }],
         };
         assert!(has_actionable_goals(&state));
@@ -1894,6 +2170,9 @@ mod tests {
                 working_memory: None,
                 execution_mode: GoalExecutionMode::Autonomous,
                 total_iterations: 0,
+                confirmation_plan: None,
+                confirmation_requested_at: None,
+                confirmation_feedback: None,
             }],
         };
         assert!(!has_actionable_goals(&state));

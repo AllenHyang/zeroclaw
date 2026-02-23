@@ -83,7 +83,10 @@ pub fn init_llm_rate_limiter(max_concurrent: usize, min_interval_ms: u64) {
     LLM_CONCURRENCY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max)));
     if min_interval_ms > 0 {
         LLM_TOKEN_BUCKET.get_or_init(|| {
-            Arc::new(TokenBucket::new(max, Duration::from_millis(min_interval_ms)))
+            Arc::new(TokenBucket::new(
+                max,
+                Duration::from_millis(min_interval_ms),
+            ))
         });
     }
 }

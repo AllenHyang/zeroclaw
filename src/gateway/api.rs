@@ -529,6 +529,90 @@ pub async fn handle_api_goals(
     }
 }
 
+/// Request body for POST /api/goals/{id}/confirm
+#[derive(Deserialize)]
+pub struct GoalConfirmBody {
+    pub approved: bool,
+    pub feedback: Option<String>,
+}
+
+/// POST /api/goals/{id}/confirm — approve or reject a goal's understanding plan
+pub async fn handle_api_goal_confirm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<GoalConfirmBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+    let mut goal_state = match engine.load_state().await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to load goals: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(goal) = goal_state.goals.iter_mut().find(|g| g.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Goal '{id}' not found")})),
+        )
+            .into_response();
+    };
+
+    if goal.status != crate::goals::engine::GoalStatus::AwaitingConfirmation {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Goal '{}' is not awaiting confirmation (current status: {:?})",
+                    id, goal.status
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    if body.approved {
+        goal.status = crate::goals::engine::GoalStatus::InProgress;
+        goal.updated_at = chrono::Utc::now().to_rfc3339();
+    } else {
+        // Reject: clear plan, store feedback for re-generation
+        goal.confirmation_plan = None;
+        goal.confirmation_requested_at = None;
+        goal.confirmation_feedback = body.feedback.clone();
+        goal.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    if let Err(e) = engine.save_state(&goal_state).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save state: {e}")})),
+        )
+            .into_response();
+    }
+
+    let action = if body.approved {
+        "approved"
+    } else {
+        "rejected"
+    };
+    Json(serde_json::json!({
+        "status": "ok",
+        "goal_id": id,
+        "action": action,
+    }))
+    .into_response()
+}
+
 /// GET /api/dashboard — aggregated dashboard view
 pub async fn handle_api_dashboard(
     State(state): State<AppState>,
@@ -552,6 +636,7 @@ pub async fn handle_api_dashboard(
             let mut completed = 0u32;
             let mut in_progress = 0u32;
             let mut pending = 0u32;
+            let mut awaiting_confirmation = 0u32;
             let mut blocked = 0u32;
             let mut cancelled = 0u32;
             for g in &gs.goals {
@@ -559,6 +644,7 @@ pub async fn handle_api_dashboard(
                     GoalStatus::Completed => completed += 1,
                     GoalStatus::InProgress => in_progress += 1,
                     GoalStatus::Pending => pending += 1,
+                    GoalStatus::AwaitingConfirmation => awaiting_confirmation += 1,
                     GoalStatus::Blocked => blocked += 1,
                     GoalStatus::Cancelled => cancelled += 1,
                 }
@@ -567,6 +653,7 @@ pub async fn handle_api_dashboard(
                 "total": gs.goals.len(),
                 "completed": completed,
                 "in_progress": in_progress,
+                "awaiting_confirmation": awaiting_confirmation,
                 "pending": pending,
                 "blocked": blocked,
                 "cancelled": cancelled,
