@@ -83,11 +83,7 @@ mod tests {
     fn allows_write_when_no_protected_keys() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "default_model = \"glm-5\"\n").unwrap();
-        let result = check_protected_config_keys(
-            tmp.path(),
-            "default_model = \"gpt-4\"\n",
-            &[],
-        );
+        let result = check_protected_config_keys(tmp.path(), "default_model = \"gpt-4\"\n", &[]);
         assert!(result.is_ok());
     }
 
@@ -183,11 +179,7 @@ default_model = "glm-5"
 "glm-4-flash" = ["gemini-2.5-flash"]
 "#;
         std::fs::write(&path, old).unwrap();
-        let result = check_protected_config_keys(
-            &path,
-            new,
-            &["reliability".into()],
-        );
+        let result = check_protected_config_keys(&path, new, &["reliability".into()]);
         assert!(result.is_err());
     }
 }

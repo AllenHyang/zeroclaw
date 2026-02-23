@@ -161,13 +161,11 @@ impl Tool for FileWriteTool {
         }
 
         // Protected config key guard
-        if let Err(msg) =
-            super::config_guard::check_protected_config_keys(
-                &resolved_target,
-                content,
-                &self.protected_config_keys,
-            )
-        {
+        if let Err(msg) = super::config_guard::check_protected_config_keys(
+            &resolved_target,
+            content,
+            &self.protected_config_keys,
+        ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
