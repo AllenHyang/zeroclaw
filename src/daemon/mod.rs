@@ -859,9 +859,24 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             // Approximate iteration cost: use agent max_tool_iterations as upper bound
             let iter_cost = config.agent.max_tool_iterations as u32;
 
+            // Check if the agent already changed the goal status via state
+            // reconciliation (directly editing goals.json). If so, trust that
+            // over output-text parsing.
+            let agent_reconciled_status = state.goals[gi].status.clone();
+
             match result {
                 Ok(Ok(output)) => {
-                    let status = GoalEngine::interpret_autonomous_result(&output);
+                    let status = if agent_reconciled_status == GoalStatus::Completed {
+                        crate::goals::engine::AutonomousSessionStatus::Completed
+                    } else if agent_reconciled_status == GoalStatus::Blocked {
+                        let reason = state.goals[gi]
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "marked blocked by agent".into());
+                        crate::goals::engine::AutonomousSessionStatus::Blocked(reason)
+                    } else {
+                        GoalEngine::interpret_autonomous_result(&output)
+                    };
                     let wm = GoalEngine::extract_working_memory(&output, 2000);
                     state.goals[gi].working_memory = Some(wm);
                     state.goals[gi].total_iterations += iter_cost;
