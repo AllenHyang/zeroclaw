@@ -19,6 +19,7 @@ pub mod browser;
 pub mod browser_open;
 pub mod cli_discovery;
 pub mod composio;
+pub mod config_guard;
 pub mod content_search;
 pub mod cron_add;
 pub mod cron_list;
@@ -209,8 +210,14 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(shell_status::ShellStatusTool::new(Arc::clone(&bg_registry))),
         Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
-        Arc::new(FileEditTool::new(security.clone())),
+        Arc::new(FileWriteTool::with_protected_keys(
+            security.clone(),
+            root_config.autonomy.protected_config_keys.clone(),
+        )),
+        Arc::new(FileEditTool::with_protected_keys(
+            security.clone(),
+            root_config.autonomy.protected_config_keys.clone(),
+        )),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
         Arc::new(CronAddTool::new(config.clone(), security.clone())),

@@ -12,11 +12,25 @@ use std::sync::Arc;
 /// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    protected_config_keys: Vec<String>,
 }
 
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            protected_config_keys: Vec::new(),
+        }
+    }
+
+    pub fn with_protected_keys(
+        security: Arc<SecurityPolicy>,
+        protected_config_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            security,
+            protected_config_keys,
+        }
     }
 }
 
@@ -216,6 +230,20 @@ impl Tool for FileEditTool {
         }
 
         let new_content = content.replacen(old_string, new_string, 1);
+
+        // Protected config key guard
+        if let Err(msg) = super::config_guard::check_protected_config_keys(
+            &resolved_target,
+            &new_content,
+            &self.protected_config_keys,
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(msg),
+                error_kind: Some(ErrorKind::PolicyDenied),
+            });
+        }
 
         match tokio::fs::write(&resolved_target, &new_content).await {
             Ok(()) => Ok(ToolResult {

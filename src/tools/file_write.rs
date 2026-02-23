@@ -7,11 +7,25 @@ use std::sync::Arc;
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    protected_config_keys: Vec<String>,
 }
 
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            protected_config_keys: Vec::new(),
+        }
+    }
+
+    pub fn with_protected_keys(
+        security: Arc<SecurityPolicy>,
+        protected_config_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            security,
+            protected_config_keys,
+        }
     }
 }
 
@@ -144,6 +158,22 @@ impl Tool for FileWriteTool {
                     error_kind: Some(ErrorKind::PermissionDenied),
                 });
             }
+        }
+
+        // Protected config key guard
+        if let Err(msg) =
+            super::config_guard::check_protected_config_keys(
+                &resolved_target,
+                content,
+                &self.protected_config_keys,
+            )
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(msg),
+                error_kind: Some(ErrorKind::PolicyDenied),
+            });
         }
 
         if !self.security.record_action() {

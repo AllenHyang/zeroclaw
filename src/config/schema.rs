@@ -1901,6 +1901,12 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Config keys that the agent is forbidden from modifying via file_write/file_edit.
+    /// When the agent writes to config.toml, any change to these top-level keys is rejected.
+    /// Example: `["default_model", "default_provider", "api_key"]`
+    #[serde(default)]
+    pub protected_config_keys: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1969,6 +1975,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            protected_config_keys: Vec::new(),
         }
     }
 }
@@ -4890,6 +4897,7 @@ default_temperature = 0.7
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                protected_config_keys: vec![],
             },
             security: SecurityConfig::default(),
             runtime: RuntimeConfig {
