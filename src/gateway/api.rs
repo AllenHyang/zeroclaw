@@ -64,6 +64,42 @@ pub struct CronAddBody {
     pub command: String,
 }
 
+#[derive(Deserialize)]
+pub struct GoalCreateBody {
+    pub description: String,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub steps: Option<Vec<GoalStepBody>>,
+    #[serde(default)]
+    pub success_criteria: Option<String>,
+    #[serde(default)]
+    pub constraints: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct GoalStepBody {
+    pub description: String,
+}
+
+#[derive(Deserialize)]
+pub struct GoalUpdateBody {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -613,6 +649,213 @@ pub async fn handle_api_goal_confirm(
     .into_response()
 }
 
+/// POST /api/goals — create a new goal
+pub async fn handle_api_goals_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<GoalCreateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let description = body.description.trim().to_string();
+    if description.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "description must not be empty"})),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+
+    let mut goal_state = match engine.load_state().await {
+        Ok(gs) => gs,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to load goals: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let id = next_goal_id(&goal_state.goals);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let steps: Vec<crate::goals::engine::Step> = body
+        .steps
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| crate::goals::engine::Step {
+            id: format!("{}-s{}", id, i + 1),
+            description: s.description,
+            status: crate::goals::engine::StepStatus::Pending,
+            result: None,
+            attempts: 0,
+        })
+        .collect();
+
+    let goal = crate::goals::engine::Goal {
+        id: id.clone(),
+        description: description.clone(),
+        status: body
+            .status
+            .as_deref()
+            .map(parse_status)
+            .unwrap_or(crate::goals::engine::GoalStatus::Pending),
+        priority: body
+            .priority
+            .as_deref()
+            .map(parse_priority)
+            .unwrap_or_default(),
+        created_at: now.clone(),
+        updated_at: now,
+        steps,
+        context: body.context.unwrap_or_default(),
+        last_error: None,
+        success_criteria: body.success_criteria,
+        constraints: body.constraints,
+        working_memory: None,
+        execution_mode: body
+            .execution_mode
+            .as_deref()
+            .map(parse_execution_mode)
+            .unwrap_or_default(),
+        total_iterations: 0,
+    };
+
+    goal_state.goals.push(goal.clone());
+
+    if let Err(e) = engine.save_state(&goal_state).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save goals: {e}")})),
+        )
+            .into_response();
+    }
+
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "goal_created",
+        "goal_id": id,
+        "description": description,
+    }));
+
+    (StatusCode::CREATED, Json(serde_json::json!({"goal": goal}))).into_response()
+}
+
+/// PATCH /api/goals/{id} — update an existing goal
+pub async fn handle_api_goals_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<GoalUpdateBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+
+    let mut goal_state = match engine.load_state().await {
+        Ok(gs) => gs,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to load goals: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let goal = match goal_state.goals.iter_mut().find(|g| g.id == id) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Goal {id} not found")})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(ref s) = body.status {
+        goal.status = parse_status(s);
+    }
+    if let Some(ref p) = body.priority {
+        goal.priority = parse_priority(p);
+    }
+    if let Some(ref d) = body.description {
+        goal.description = d.clone();
+    }
+    if let Some(ref e) = body.last_error {
+        goal.last_error = Some(e.clone());
+    }
+    goal.updated_at = chrono::Utc::now().to_rfc3339();
+
+    let updated_goal = goal.clone();
+
+    if let Err(e) = engine.save_state(&goal_state).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save goals: {e}")})),
+        )
+            .into_response();
+    }
+
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "goal_updated",
+        "goal_id": id,
+    }));
+
+    Json(serde_json::json!({"goal": updated_goal})).into_response()
+}
+
+// ── Goal helpers ────────────────────────────────────────────────
+
+fn next_goal_id(goals: &[crate::goals::engine::Goal]) -> String {
+    let max_num = goals
+        .iter()
+        .filter_map(|g| {
+            g.id.strip_prefix("g-")
+                .or_else(|| g.id.strip_prefix('g'))
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    format!("g-{:03}", max_num + 1)
+}
+
+fn parse_priority(s: &str) -> crate::goals::engine::GoalPriority {
+    match s {
+        "low" => crate::goals::engine::GoalPriority::Low,
+        "high" => crate::goals::engine::GoalPriority::High,
+        "critical" => crate::goals::engine::GoalPriority::Critical,
+        _ => crate::goals::engine::GoalPriority::Medium,
+    }
+}
+
+fn parse_status(s: &str) -> crate::goals::engine::GoalStatus {
+    match s {
+        "in_progress" => crate::goals::engine::GoalStatus::InProgress,
+        "completed" => crate::goals::engine::GoalStatus::Completed,
+        "blocked" => crate::goals::engine::GoalStatus::Blocked,
+        "cancelled" => crate::goals::engine::GoalStatus::Cancelled,
+        _ => crate::goals::engine::GoalStatus::Pending,
+    }
+}
+
+fn parse_execution_mode(s: &str) -> crate::goals::engine::GoalExecutionMode {
+    match s {
+        "stepped" => crate::goals::engine::GoalExecutionMode::Stepped,
+        _ => crate::goals::engine::GoalExecutionMode::Autonomous,
+    }
+}
+
 /// GET /api/dashboard — aggregated dashboard view
 pub async fn handle_api_dashboard(
     State(state): State<AppState>,
@@ -783,4 +1026,45 @@ fn mask_sensitive_fields(toml_str: &str) -> String {
         output.push('\n');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_goal(id: &str) -> crate::goals::engine::Goal {
+        crate::goals::engine::Goal {
+            id: id.to_string(),
+            description: String::new(),
+            status: crate::goals::engine::GoalStatus::Pending,
+            priority: crate::goals::engine::GoalPriority::Medium,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps: vec![],
+            context: String::new(),
+            last_error: None,
+            success_criteria: None,
+            constraints: None,
+            working_memory: None,
+            execution_mode: crate::goals::engine::GoalExecutionMode::Autonomous,
+            total_iterations: 0,
+        }
+    }
+
+    #[test]
+    fn next_goal_id_empty() {
+        assert_eq!(next_goal_id(&[]), "g-001");
+    }
+
+    #[test]
+    fn next_goal_id_sequential() {
+        let goals = vec![make_goal("g-001"), make_goal("g-002"), make_goal("g-003")];
+        assert_eq!(next_goal_id(&goals), "g-004");
+    }
+
+    #[test]
+    fn next_goal_id_mixed_formats() {
+        let goals = vec![make_goal("g1"), make_goal("g-005"), make_goal("g-002")];
+        assert_eq!(next_goal_id(&goals), "g-006");
+    }
 }

@@ -29,7 +29,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use parking_lot::Mutex;
@@ -658,6 +658,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/goals/{id}/confirm",
             post(api::handle_api_goal_confirm),
         )
+        .route("/api/goals", post(api::handle_api_goals_create))
+        .route("/api/goals/{id}", patch(api::handle_api_goals_update))
         .route("/api/dashboard", get(api::handle_api_dashboard))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
