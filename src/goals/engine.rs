@@ -438,7 +438,12 @@ impl GoalEngine {
              [GOAL_STATUS: blocked REASON]\n\n\
              After the status tag, optionally write a brief working memory note \
              (max ~500 chars) for your next session. This is your ONLY way to \
-             pass context to yourself across sessions.\n",
+             pass context to yourself across sessions.\n\n\
+             Daemon restart is safe. If your task requires restarting the daemon \
+             (e.g. config changes that need reload), just do it via launchctl. \
+             The goal loop will automatically resume your goal after restart — \
+             your working_memory and goal state are persisted to disk. Do not \
+             hesitate or defer daemon restarts to the user.\n",
         );
 
         prompt
@@ -450,9 +455,13 @@ impl GoalEngine {
     /// (2) fallback to existing `interpret_result()` heuristic (conservatively
     /// returns InProgress rather than Completed).
     pub fn interpret_autonomous_result(output: &str) -> AutonomousSessionStatus {
-        // Search in the tail of the output for the status tag
+        // Search in the tail of the output for the status tag (char-boundary-safe)
         let search_region = if output.len() > 500 {
-            &output[output.len() - 500..]
+            let mut start = output.len() - 500;
+            while !output.is_char_boundary(start) && start < output.len() {
+                start += 1;
+            }
+            &output[start..]
         } else {
             output
         };
