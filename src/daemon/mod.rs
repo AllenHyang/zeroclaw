@@ -303,7 +303,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let mut failure_map: HashMap<String, (u32, Instant)> = HashMap::new();
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    let period = Duration::from_secs(u64::from(interval_mins) * 60);
+    // Start first tick after one full interval (not immediately on daemon start).
+    let mut interval = tokio::time::interval_at(Instant::now() + period, period);
 
     loop {
         interval.tick().await;
@@ -356,21 +358,26 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     failure_map.remove(&task);
                     crate::health::set_component_activity("heartbeat", None);
                     crate::health::mark_component_ok("heartbeat");
-                    // Deliver to configured channel (best-effort)
-                    if let (Some(ch_name), Some(target)) =
-                        (&config.heartbeat.channel, &config.heartbeat.target)
-                    {
-                        if let Err(e) = deliver_notification(
-                            &config,
-                            ch_name,
-                            target,
-                            "🦀 ZeroClaw 心跳报告",
-                            &output,
-                        )
-                        .await
+                    // Deliver to configured channel (best-effort), skip empty output
+                    let trimmed = output.trim();
+                    if !trimmed.is_empty() {
+                        if let (Some(ch_name), Some(target)) =
+                            (&config.heartbeat.channel, &config.heartbeat.target)
                         {
-                            tracing::warn!("Heartbeat delivery to {ch_name} failed: {e}");
+                            if let Err(e) = deliver_notification(
+                                &config,
+                                ch_name,
+                                target,
+                                "🦀 ZeroClaw 心跳报告",
+                                trimmed,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Heartbeat delivery to {ch_name} failed: {e}");
+                            }
                         }
+                    } else {
+                        tracing::debug!("Heartbeat task returned empty output, skipping delivery");
                     }
                 }
                 Err(e) => {
@@ -599,41 +606,49 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
         // loop body if actionable goals remain after this cycle.
         next_delay = idle_interval;
 
-        // ── Auto-approve: promote pending low-priority goals ─────────
-        if config.goal_loop.auto_approve_low_priority {
-            let mut promoted = false;
-            let mode = if config.goal_loop.default_execution_mode == "stepped" {
-                GoalExecutionMode::Stepped
-            } else {
-                GoalExecutionMode::Autonomous
-            };
-            for goal in &mut state.goals {
-                if goal.status == GoalStatus::Pending
-                    && goal.priority == GoalPriority::Low
-                    && !goal.steps.is_empty()
-                {
-                    goal.status = GoalStatus::InProgress;
-                    goal.execution_mode = mode.clone();
-                    goal.updated_at = chrono::Utc::now().to_rfc3339();
-                    tracing::info!(
-                        goal_id = %goal.id,
-                        goal = %goal.description,
-                        mode = ?mode,
-                        "Goal loop: auto-approved low-priority goal"
-                    );
-                    promoted = true;
+        // ── Auto-approve: promote pending goals ──────────────────────
+        {
+            let approve_all = config.goal_loop.auto_approve_all;
+            let approve_low = config.goal_loop.auto_approve_low_priority;
+
+            if approve_all || approve_low {
+                let mut promoted = false;
+                let mode = if config.goal_loop.default_execution_mode == "stepped" {
+                    GoalExecutionMode::Stepped
+                } else {
+                    GoalExecutionMode::Autonomous
+                };
+                for goal in &mut state.goals {
+                    if goal.status != GoalStatus::Pending || goal.steps.is_empty() {
+                        continue;
+                    }
+                    if approve_all || (approve_low && goal.priority == GoalPriority::Low) {
+                        goal.status = GoalStatus::InProgress;
+                        goal.execution_mode = mode.clone();
+                        goal.updated_at = chrono::Utc::now().to_rfc3339();
+                        tracing::info!(
+                            goal_id = %goal.id,
+                            goal = %goal.description,
+                            priority = ?goal.priority,
+                            mode = ?mode,
+                            "Goal loop: auto-approved pending goal"
+                        );
+                        promoted = true;
+                    }
                 }
-            }
-            if promoted {
-                if let Err(e) = engine.save_state(&state).await {
-                    tracing::warn!("Goal loop: failed to save state after auto-approve: {e}");
+                if promoted {
+                    if let Err(e) = engine.save_state(&state).await {
+                        tracing::warn!(
+                            "Goal loop: failed to save state after auto-approve: {e}"
+                        );
+                    }
+                    notify_goal_event(
+                        &config,
+                        "🦀 ZeroClaw 目标更新",
+                        "已自动批准待处理目标",
+                    )
+                    .await;
                 }
-                notify_goal_event(
-                    &config,
-                    "🦀 ZeroClaw 目标更新",
-                    "已自动批准待处理的低优先级目标",
-                )
-                .await;
             }
         }
 
