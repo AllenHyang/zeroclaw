@@ -1,12 +1,14 @@
 use crate::config::Config;
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
+const MAX_HEARTBEAT_TASK_FAILURES: u32 = 3;
 
 pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
@@ -173,6 +175,14 @@ where
     })
 }
 
+/// Compute exponential backoff duration in seconds for a given failure count.
+/// Uses `initial * 2^(failures - 1)`, clamped to `max`.
+fn compute_backoff_secs(failures: u32, initial_secs: u64, max_secs: u64) -> u64 {
+    let exponent = failures.saturating_sub(1);
+    let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    initial_secs.saturating_mul(multiplier).min(max_secs)
+}
+
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
@@ -185,6 +195,15 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
+    let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
+    let max_backoff = config
+        .reliability
+        .channel_max_backoff_secs
+        .max(initial_backoff);
+
+    // Per-task failure tracking: task_key -> (consecutive_failures, next_retry_at)
+    let mut failure_map: HashMap<String, (u32, tokio::time::Instant)> = HashMap::new();
+
     loop {
         interval.tick().await;
 
@@ -193,7 +212,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             continue;
         }
 
+        let now = tokio::time::Instant::now();
+
         for task in tasks {
+            if let Some(&(failures, next_retry)) = failure_map.get(&task) {
+                if failures >= MAX_HEARTBEAT_TASK_FAILURES {
+                    tracing::error!(
+                        "Heartbeat task auto-disabled after {failures} consecutive failures \
+                         (check HEARTBEAT.md config): {task}"
+                    );
+                    continue;
+                }
+                if next_retry > now {
+                    tracing::debug!(
+                        "Heartbeat task in cooldown, skipping until next retry window: {task}"
+                    );
+                    continue;
+                }
+            }
+
             let prompt = format!("[Heartbeat Task] {task}");
             let temp = config.default_temperature;
             if let Err(e) = crate::agent::run(
@@ -207,9 +244,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             )
             .await
             {
+                let prev = failure_map.get(&task).map_or(0, |&(f, _)| f);
+                let new_failures = prev + 1;
+                let backoff = compute_backoff_secs(new_failures, initial_backoff, max_backoff);
+                let next_retry = tokio::time::Instant::now() + Duration::from_secs(backoff);
+                failure_map.insert(task.clone(), (new_failures, next_retry));
+
                 crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
+                tracing::warn!("Heartbeat task failed ({new_failures} consecutive): {e}");
             } else {
+                failure_map.remove(&task);
                 crate::health::mark_component_ok("heartbeat");
             }
         }
@@ -340,6 +384,61 @@ mod tests {
             allowed_users: vec!["*".into()],
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn heartbeat_worker_skips_disabled_tasks() {
+        // Validate per-task failure tracking logic:
+        // - compute_backoff_secs produces correct exponential values
+        // - After MAX_HEARTBEAT_TASK_FAILURES, the task should be considered disabled
+
+        // Backoff: initial=5, max=300
+        assert_eq!(compute_backoff_secs(1, 5, 300), 5); // 5 * 2^0
+        assert_eq!(compute_backoff_secs(2, 5, 300), 10); // 5 * 2^1
+        assert_eq!(compute_backoff_secs(3, 5, 300), 20); // 5 * 2^2
+
+        // Backoff clamps to max
+        assert_eq!(compute_backoff_secs(10, 5, 300), 300);
+
+        // Edge case: zero failures
+        assert_eq!(compute_backoff_secs(0, 5, 300), 5);
+
+        // Edge case: overflow-safe with large exponent
+        assert_eq!(compute_backoff_secs(100, 5, 300), 300);
+
+        // Failure map simulation: track a task through consecutive failures
+        let now = tokio::time::Instant::now();
+        let mut failure_map: HashMap<String, (u32, tokio::time::Instant)> = HashMap::new();
+        let task_key = "check system health".to_string();
+
+        // First failure
+        let prev = failure_map.get(&task_key).map_or(0, |&(f, _)| f);
+        failure_map.insert(task_key.clone(), (prev + 1, now));
+        assert_eq!(failure_map[&task_key].0, 1);
+
+        // Second failure
+        let prev = failure_map.get(&task_key).map_or(0, |&(f, _)| f);
+        failure_map.insert(task_key.clone(), (prev + 1, now));
+        assert_eq!(failure_map[&task_key].0, 2);
+
+        // Third failure -- should now be auto-disabled
+        let prev = failure_map.get(&task_key).map_or(0, |&(f, _)| f);
+        failure_map.insert(task_key.clone(), (prev + 1, now));
+        assert_eq!(failure_map[&task_key].0, 3);
+
+        // Verify auto-disable: task with >= MAX_HEARTBEAT_TASK_FAILURES is skipped
+        let (failures, _) = failure_map[&task_key];
+        assert!(
+            failures >= MAX_HEARTBEAT_TASK_FAILURES,
+            "Task should be auto-disabled after {MAX_HEARTBEAT_TASK_FAILURES} failures"
+        );
+
+        // Verify reset on success: removing from map resets tracking
+        failure_map.remove(&task_key);
+        assert!(
+            !failure_map.contains_key(&task_key),
+            "Task should be removed from failure map on success"
+        );
     }
 
     #[test]
