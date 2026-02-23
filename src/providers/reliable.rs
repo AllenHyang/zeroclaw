@@ -9,56 +9,97 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-// ── Global LLM Concurrency Control ──────────────────────────────────────
-// A process-wide semaphore caps concurrent LLM calls across all daemon
-// components (channel, goal-loop, cron, heartbeat) to prevent 429 storms.
+// ── Global LLM Rate Limiter ─────────────────────────────────────────────
+// Token bucket + concurrency semaphore.  Every LLM API call (including
+// retries) must acquire a rate token *and* a concurrency permit.  The
+// permit is released as soon as the HTTP response completes, so backoff
+// sleeps do not waste concurrency slots.
 
-static LLM_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static LLM_TOKEN_BUCKET: OnceLock<Arc<TokenBucket>> = OnceLock::new();
+static LLM_CONCURRENCY: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-/// Initialise the global LLM concurrency semaphore.  Call once at daemon
-/// startup before spawning any component tasks.  Safe to call multiple times
-/// (only the first call takes effect).
-pub fn init_llm_concurrency(max: usize) {
-    LLM_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max.max(1))));
+struct TokenBucketState {
+    tokens: f64,
+    capacity: f64,
+    refill_interval: Duration,
+    last_refill: tokio::time::Instant,
 }
 
-// ── Global LLM Request Throttle ─────────────────────────────────────────
-// Enforces a minimum interval between consecutive LLM API calls to stay
-// within RPM limits.  Works alongside the concurrency semaphore above.
-
-static LLM_MIN_INTERVAL: OnceLock<Duration> = OnceLock::new();
-static LAST_LLM_REQUEST: OnceLock<Arc<tokio::sync::Mutex<tokio::time::Instant>>> = OnceLock::new();
-
-/// Initialise the global LLM request throttle.  Call once at daemon startup.
-/// `interval_ms = 0` disables throttling.
-pub fn init_llm_throttle(interval_ms: u64) {
-    LLM_MIN_INTERVAL.get_or_init(|| Duration::from_millis(interval_ms));
-    LAST_LLM_REQUEST.get_or_init(|| Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())));
+struct TokenBucket {
+    state: tokio::sync::Mutex<TokenBucketState>,
 }
 
-/// Sleep if needed so that consecutive LLM calls are at least
-/// `min_request_interval_ms` apart.  No-op when throttling is disabled (0)
-/// or uninitialised (CLI one-shot mode).
-async fn enforce_min_interval() {
-    let min = match LLM_MIN_INTERVAL.get() {
-        Some(d) if !d.is_zero() => *d,
-        _ => return,
-    };
-    if let Some(last) = LAST_LLM_REQUEST.get() {
-        let mut guard = last.lock().await;
-        let elapsed = guard.elapsed();
-        if let Some(remaining) = min.checked_sub(elapsed) {
-            tokio::time::sleep(remaining).await;
+impl TokenBucket {
+    fn new(capacity: usize, refill_interval: Duration) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(TokenBucketState {
+                tokens: capacity as f64,
+                capacity: capacity as f64,
+                refill_interval,
+                last_refill: tokio::time::Instant::now(),
+            }),
         }
-        *guard = tokio::time::Instant::now();
+    }
+
+    async fn acquire(&self) {
+        loop {
+            let sleep_dur = {
+                let mut s = self.state.lock().await;
+                // Lazy refill
+                let elapsed = s.last_refill.elapsed();
+                if !s.refill_interval.is_zero() {
+                    let new_tokens = elapsed.as_secs_f64() / s.refill_interval.as_secs_f64();
+                    s.tokens = (s.tokens + new_tokens).min(s.capacity);
+                    s.last_refill = tokio::time::Instant::now();
+                }
+                if s.tokens >= 1.0 {
+                    s.tokens -= 1.0;
+                    return;
+                }
+                // Compute sleep until next token
+                if s.refill_interval.is_zero() {
+                    // Should not happen (bucket not created when interval=0),
+                    // but guard against infinite loop.
+                    return;
+                }
+                let deficit = 1.0 - s.tokens;
+                Duration::from_secs_f64(deficit * s.refill_interval.as_secs_f64())
+            };
+            tokio::time::sleep(sleep_dur).await;
+        }
     }
 }
 
-/// Acquire a permit from the global LLM semaphore.  Returns `None` when the
-/// semaphore has not been initialised (e.g. CLI one-shot mode), in which case
-/// callers proceed without concurrency limiting.
-async fn acquire_llm_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
-    if let Some(sem) = LLM_SEMAPHORE.get() {
+/// Initialise the global LLM rate limiter.  Call once at daemon startup
+/// before spawning any component tasks.
+///
+/// - `max_concurrent`: maximum concurrent in-flight LLM requests.
+/// - `min_interval_ms`: minimum milliseconds between consecutive requests.
+///   When > 0, a token bucket is created with `capacity = max_concurrent`
+///   (burst budget) and refill rate = 1 token per `min_interval_ms`.
+///   When 0, only the concurrency semaphore is active.
+pub fn init_llm_rate_limiter(max_concurrent: usize, min_interval_ms: u64) {
+    let max = max_concurrent.max(1);
+    LLM_CONCURRENCY.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max)));
+    if min_interval_ms > 0 {
+        LLM_TOKEN_BUCKET.get_or_init(|| {
+            Arc::new(TokenBucket::new(max, Duration::from_millis(min_interval_ms)))
+        });
+    }
+}
+
+/// Acquire a rate token from the token bucket.  No-op when the bucket has
+/// not been initialised (CLI one-shot mode or `min_interval_ms = 0`).
+async fn acquire_rate_token() {
+    if let Some(bucket) = LLM_TOKEN_BUCKET.get() {
+        bucket.acquire().await;
+    }
+}
+
+/// Acquire a concurrency permit.  Returns `None` when the semaphore has
+/// not been initialised (CLI one-shot mode).
+async fn acquire_concurrency_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if let Some(sem) = LLM_CONCURRENCY.get() {
         Arc::clone(sem).acquire_owned().await.ok()
     } else {
         None
@@ -366,24 +407,22 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let _llm_permit = acquire_llm_permit().await;
-        enforce_min_interval().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
-        // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    acquire_rate_token().await;
+                    let _permit = acquire_concurrency_permit().await;
+                    let result = provider
                         .chat_with_system(system_prompt, message, current_model, temperature)
-                        .await
-                    {
+                        .await;
+                    drop(_permit);
+
+                    match result {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -413,8 +452,6 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::warn!(
@@ -492,8 +529,6 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let _llm_permit = acquire_llm_permit().await;
-        enforce_min_interval().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -502,10 +537,14 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    acquire_rate_token().await;
+                    let _permit = acquire_concurrency_permit().await;
+                    let result = provider
                         .chat_with_history(messages, current_model, temperature)
-                        .await
-                    {
+                        .await;
+                    drop(_permit);
+
+                    match result {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -618,8 +657,6 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let _llm_permit = acquire_llm_permit().await;
-        enforce_min_interval().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -628,10 +665,14 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider
+                    acquire_rate_token().await;
+                    let _permit = acquire_concurrency_permit().await;
+                    let result = provider
                         .chat_with_tools(messages, tools, current_model, temperature)
-                        .await
-                    {
+                        .await;
+                    drop(_permit);
+
+                    match result {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -730,8 +771,6 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let _llm_permit = acquire_llm_permit().await;
-        enforce_min_interval().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -740,11 +779,16 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    acquire_rate_token().await;
+                    let _permit = acquire_concurrency_permit().await;
                     let req = ChatRequest {
                         messages: request.messages,
                         tools: request.tools,
                     };
-                    match provider.chat(req, current_model, temperature).await {
+                    let result = provider.chat(req, current_model, temperature).await;
+                    drop(_permit);
+
+                    match result {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -883,10 +927,15 @@ impl Provider for ReliableProvider {
                 options,
             );
 
-            // Use a channel to bridge the stream with logging
+            // Use a channel to bridge the stream with logging.
+            // Acquire rate token + concurrency permit inside the spawned task
+            // so the permit is held for the duration of the HTTP stream.
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
             tokio::spawn(async move {
+                acquire_rate_token().await;
+                let _permit = acquire_concurrency_permit().await;
+
                 let mut stream = stream;
                 while let Some(chunk) = stream.next().await {
                     if let Err(ref e) = chunk {
@@ -900,6 +949,7 @@ impl Provider for ReliableProvider {
                         break; // Receiver dropped
                     }
                 }
+                // _permit is dropped here when stream ends
             });
 
             // Convert channel receiver to stream
@@ -2046,36 +2096,65 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
-    // ── Global LLM throttle tests ───────────────────────────────
+    // ── Token bucket tests ──────────────────────────────────────
 
     #[tokio::test]
-    async fn enforce_min_interval_respects_gap() {
-        // Use a dedicated OnceLock-bypassing approach: directly test the logic
-        // by calling init (idempotent) and measuring elapsed time.
-        init_llm_throttle(200); // 200ms minimum gap
+    async fn token_bucket_allows_burst_then_throttles() {
+        let bucket = TokenBucket::new(2, Duration::from_millis(200));
 
         let start = tokio::time::Instant::now();
-        enforce_min_interval().await;
-        enforce_min_interval().await;
-        let elapsed = start.elapsed();
-
-        // Second call should have waited ~200ms.
+        // First two acquires should be instant (burst budget = 2)
+        bucket.acquire().await;
+        bucket.acquire().await;
+        let burst_elapsed = start.elapsed();
         assert!(
-            elapsed >= Duration::from_millis(180),
-            "expected >=180ms gap, got {elapsed:?}"
+            burst_elapsed < Duration::from_millis(50),
+            "burst should be near-instant, got {burst_elapsed:?}"
+        );
+
+        // Third acquire must wait for a refill (~200ms)
+        bucket.acquire().await;
+        let total_elapsed = start.elapsed();
+        assert!(
+            total_elapsed >= Duration::from_millis(150),
+            "third acquire should wait for refill, got {total_elapsed:?}"
         );
     }
 
     #[tokio::test]
-    async fn enforce_min_interval_zero_is_noop() {
-        // When interval is 0, enforce_min_interval returns immediately.
-        // OnceLock is already set from the test above, so we test the branch
-        // directly: a zero Duration is checked inside the function.
-        // We verify it doesn't block by timing two rapid calls.
-        // Note: since OnceLock is process-wide and already initialised with
-        // 200ms, we test the zero-path logic by checking the early-return
-        // branch in isolation.
-        let min = Duration::from_millis(0);
-        assert!(min.is_zero(), "zero duration should be detected as zero");
+    async fn token_bucket_concurrent_acquire_serializes() {
+        let bucket = Arc::new(TokenBucket::new(1, Duration::from_millis(100)));
+
+        let start = tokio::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let b = Arc::clone(&bucket);
+            handles.push(tokio::spawn(async move {
+                b.acquire().await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        // 1 token initially, then 2 more refills needed at ~100ms each
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "concurrent acquires should serialize, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_rate_token_noop_when_uninitialized() {
+        // In test mode, LLM_TOKEN_BUCKET is typically not initialized.
+        // acquire_rate_token should return immediately (no-op).
+        let start = tokio::time::Instant::now();
+        acquire_rate_token().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "no-op acquire should be instant, got {elapsed:?}"
+        );
     }
 }

@@ -22,8 +22,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .channel_max_backoff_secs
         .max(initial_backoff);
 
-    crate::providers::reliable::init_llm_concurrency(config.reliability.max_concurrent_llm_calls);
-    crate::providers::reliable::init_llm_throttle(config.reliability.min_request_interval_ms);
+    crate::providers::reliable::init_llm_rate_limiter(
+        config.reliability.max_concurrent_llm_calls,
+        config.reliability.min_request_interval_ms,
+    );
 
     crate::health::mark_component_ok("daemon");
 
