@@ -521,7 +521,9 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
     let autonomous_timeout = Duration::from_secs(config.goal_loop.autonomous_timeout_secs.max(30));
     let max_total_iterations = config.goal_loop.max_total_goal_iterations;
 
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    let idle_interval = Duration::from_secs(u64::from(interval_mins) * 60);
+    let active_interval = Duration::from_secs(5);
+    let mut next_delay = Duration::ZERO; // first tick is immediate
 
     // Intent scan state
     let mem = crate::memory::SqliteMemory::new(&config.workspace_dir).ok(); // None if DB fails — intent scan will be skipped
@@ -533,7 +535,7 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
     let mut last_exploration_date: Option<chrono::NaiveDate> = None;
 
     loop {
-        interval.tick().await;
+        tokio::time::sleep(next_delay).await;
 
         let mut state = match engine.load_state().await {
             Ok(s) => s,
@@ -1253,6 +1255,13 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
 
             let _ = engine.save_state(&state).await;
         }
+
+        // Dynamic interval: short delay if goals are actionable, long delay if idle
+        next_delay = if has_actionable_goals(&state) {
+            active_interval
+        } else {
+            idle_interval
+        };
     }
 }
 
