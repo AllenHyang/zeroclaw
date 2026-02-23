@@ -666,6 +666,7 @@ impl BrowserTool {
                 success: true,
                 output: serde_json::to_string_pretty(&output).unwrap_or_default(),
                 error: None,
+                error_kind: None,
             })
         }
 
@@ -813,6 +814,7 @@ impl BrowserTool {
                     success: true,
                     output,
                     error: None,
+                    error_kind: None,
                 });
             }
 
@@ -830,6 +832,7 @@ impl BrowserTool {
                 success: false,
                 output: String::new(),
                 error,
+                error_kind: None,
             });
         }
 
@@ -838,6 +841,7 @@ impl BrowserTool {
                 success: true,
                 output: body,
                 error: None,
+                error_kind: None,
             });
         }
 
@@ -848,6 +852,7 @@ impl BrowserTool {
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
             )),
+            error_kind: None,
         })
     }
 
@@ -876,12 +881,14 @@ impl BrowserTool {
                 success: true,
                 output,
                 error: None,
+                error_kind: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: resp.error,
+                error_kind: None,
             })
         }
     }
@@ -1023,6 +1030,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                error_kind: None,
             });
         }
 
@@ -1031,6 +1039,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                error_kind: None,
             });
         }
 
@@ -1041,6 +1050,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(error.to_string()),
+                    error_kind: None,
                 });
             }
         };
@@ -1056,6 +1066,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown action: {action_str}")),
+                error_kind: None,
             });
         }
 
@@ -1068,6 +1079,7 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
+                error_kind: None,
             });
         }
 
@@ -1078,6 +1090,7 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    error_kind: None,
                 });
             }
         };

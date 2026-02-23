@@ -129,6 +129,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                error_kind: None,
             });
         }
 
@@ -137,6 +138,7 @@ impl Tool for WebFetchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                error_kind: None,
             });
         }
 
@@ -147,6 +149,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    error_kind: None,
                 })
             }
         };
@@ -172,6 +175,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
+                    error_kind: None,
                 })
             }
         };
@@ -183,6 +187,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("HTTP request failed: {e}")),
+                    error_kind: None,
                 })
             }
         };
@@ -197,6 +202,7 @@ impl Tool for WebFetchTool {
                     status.as_u16(),
                     status.canonical_reason().unwrap_or("Unknown")
                 )),
+                error_kind: None,
             });
         }
 
@@ -215,6 +221,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read response body: {e}")),
+                    error_kind: None,
                 })
             }
         };
@@ -237,6 +244,7 @@ impl Tool for WebFetchTool {
                     "Unsupported content type: {content_type}. \
                      web_fetch supports text/html, text/plain, text/markdown, and application/json."
                 )),
+                error_kind: None,
             });
         };
 
@@ -246,6 +254,7 @@ impl Tool for WebFetchTool {
             success: true,
             output,
             error: None,
+            error_kind: None,
         })
     }
 }

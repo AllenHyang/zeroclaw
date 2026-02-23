@@ -702,12 +702,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            error_kind: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list actions: {e}")),
+                        error_kind: None,
                     }),
                 }
             }
@@ -727,6 +729,7 @@ impl Tool for ComposioTool {
                                     "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
                                 ),
                                 error: None,
+                                error_kind: None,
                             });
                         }
 
@@ -752,12 +755,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            error_kind: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list connected accounts: {e}")),
+                        error_kind: None,
                     }),
                 }
             }
@@ -771,6 +776,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                        error_kind: None,
                     });
                 }
 
@@ -805,11 +811,10 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            error_kind: None,
                         })
                     }
                     Err(e) => {
-                        // On failure, try to fetch the tool's parameter schema
-                        // so the LLM can self-correct on its next attempt.
                         let schema_hint = self
                             .get_tool_schema(action_name)
                             .await
@@ -822,6 +827,7 @@ impl Tool for ComposioTool {
                             error: Some(format!(
                                 "Action execution failed: {e}{schema_hint}"
                             )),
+                            error_kind: None,
                         })
                     }
                 }
@@ -836,6 +842,7 @@ impl Tool for ComposioTool {
                         success: false,
                         output: String::new(),
                         error: Some(error),
+                        error_kind: None,
                     });
                 }
 
@@ -867,12 +874,14 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            error_kind: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to get connection URL: {e}")),
+                        error_kind: None,
                     }),
                 }
             }
@@ -883,7 +892,8 @@ impl Tool for ComposioTool {
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'list_accounts', 'execute', or 'connect'."
                 )),
-            }),
+                error_kind: None,
+}),
         }
     }
 }
