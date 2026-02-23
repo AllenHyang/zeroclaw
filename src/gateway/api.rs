@@ -528,6 +528,150 @@ pub async fn handle_api_goals(
     }
 }
 
+/// GET /api/dashboard — aggregated dashboard view
+pub async fn handle_api_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    // Health + uptime
+    let health = crate::health::snapshot();
+    let uptime_seconds = health.uptime_seconds;
+
+    // Goals summary
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+    let goals_summary = match engine.load_state().await {
+        Ok(gs) => {
+            use crate::goals::engine::GoalStatus;
+            let mut completed = 0u32;
+            let mut in_progress = 0u32;
+            let mut pending = 0u32;
+            let mut blocked = 0u32;
+            let mut cancelled = 0u32;
+            for g in &gs.goals {
+                match g.status {
+                    GoalStatus::Completed => completed += 1,
+                    GoalStatus::InProgress => in_progress += 1,
+                    GoalStatus::Pending => pending += 1,
+                    GoalStatus::Blocked => blocked += 1,
+                    GoalStatus::Cancelled => cancelled += 1,
+                }
+            }
+            serde_json::json!({
+                "total": gs.goals.len(),
+                "completed": completed,
+                "in_progress": in_progress,
+                "pending": pending,
+                "blocked": blocked,
+                "cancelled": cancelled,
+            })
+        }
+        Err(_) => serde_json::json!({"total": 0}),
+    };
+
+    // Cost
+    let cost = if let Some(ref tracker) = state.cost_tracker {
+        match tracker.get_summary() {
+            Ok(s) => serde_json::json!({
+                "session_cost_usd": s.session_cost_usd,
+                "daily_cost_usd": s.daily_cost_usd,
+                "monthly_cost_usd": s.monthly_cost_usd,
+                "total_tokens": s.total_tokens,
+                "request_count": s.request_count,
+            }),
+            Err(_) => serde_json::json!({}),
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Memory count
+    let memory_count = state.mem.count().await.unwrap_or(0);
+
+    // Tools + capabilities
+    let tools_count = state.tools_registry.len();
+    let capabilities = derive_capabilities(&state.tools_registry);
+
+    // Milestones (last 10)
+    use crate::memory::MemoryCategory;
+    let milestones: Vec<serde_json::Value> = state
+        .mem
+        .list(
+            Some(&MemoryCategory::Custom("milestone".into())),
+            None,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .take(10)
+        .map(|e| {
+            serde_json::json!({
+                "key": e.key,
+                "content": e.content,
+                "timestamp": e.timestamp,
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "uptime_seconds": uptime_seconds,
+        "goals": goals_summary,
+        "cost": cost,
+        "memory": { "total_entries": memory_count },
+        "tools": { "registered": tools_count },
+        "capabilities": capabilities,
+        "milestones": milestones,
+        "health": health,
+    });
+
+    Json(body).into_response()
+}
+
+/// Derive high-level capability labels from registered tool names.
+fn derive_capabilities(tools: &[crate::tools::traits::ToolSpec]) -> Vec<&'static str> {
+    let names: std::collections::HashSet<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let mut caps = Vec::new();
+
+    if names.contains("shell") {
+        caps.push("shell");
+    }
+    if names.contains("file_read") || names.contains("file_write") || names.contains("file_edit") {
+        caps.push("file_system");
+    }
+    if names.contains("memory_store") || names.contains("memory_recall") {
+        caps.push("memory");
+    }
+    if names.contains("browser") || names.contains("browser_open") {
+        caps.push("web_browsing");
+    }
+    if names.contains("web_search") || names.contains("http_request") {
+        caps.push("web");
+    }
+    if names.contains("git_operations") {
+        caps.push("git");
+    }
+    if names.contains("cron_add") || names.contains("cron_list") {
+        caps.push("cron");
+    }
+    if names.contains("delegate") {
+        caps.push("delegation");
+    }
+    if names.contains("screenshot") || names.contains("image_info") {
+        caps.push("vision");
+    }
+    if names.contains("pdf_read") {
+        caps.push("pdf");
+    }
+
+    caps
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn mask_sensitive_fields(toml_str: &str) -> String {

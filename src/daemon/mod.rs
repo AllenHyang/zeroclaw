@@ -99,6 +99,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     if config.cron.enabled {
         // Ensure nightly consolidation job exists (idempotent).
         ensure_consolidation_job(&config);
+        // Ensure daily digest job exists (idempotent).
+        ensure_daily_digest_job(&config);
 
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -1063,6 +1065,21 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
 
                 if agent_reconciled_status == GoalStatus::Completed {
                     crate::health::mark_component_ok("goal-loop");
+                    // Record milestone
+                    if let Some(ref mem) = mem {
+                        use crate::memory::Memory;
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let milestone_key = format!("milestone-{}-{}", goal_id, ts);
+                        let milestone_content = format!("Completed: {}", state.goals[gi].description);
+                        if let Err(e) = mem.store(
+                            &milestone_key,
+                            &milestone_content,
+                            crate::memory::MemoryCategory::Custom("milestone".into()),
+                            None,
+                        ).await {
+                            tracing::warn!("Failed to record milestone: {e}");
+                        }
+                    }
                     let msg = format_goal_completed_message(&state.goals[gi]);
                     notify_goal_event(&config, &msg).await;
                 } else {
@@ -1109,6 +1126,21 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             state.goals[gi].last_error = None;
                             let _ = engine.save_state(&state).await;
                             crate::health::mark_component_ok("goal-loop");
+                            // Record milestone
+                            if let Some(ref mem) = mem {
+                                use crate::memory::Memory;
+                                let ts = chrono::Utc::now().to_rfc3339();
+                                let milestone_key = format!("milestone-{}-{}", goal_id, ts);
+                                let milestone_content = format!("Completed: {}", state.goals[gi].description);
+                                if let Err(e) = mem.store(
+                                    &milestone_key,
+                                    &milestone_content,
+                                    crate::memory::MemoryCategory::Custom("milestone".into()),
+                                    None,
+                                ).await {
+                                    tracing::warn!("Failed to record milestone: {e}");
+                                }
+                            }
                             let msg = format_goal_completed_message(&state.goals[gi]);
                             notify_goal_event(&config, &msg).await;
                         }
@@ -1296,6 +1328,21 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
             if all_done {
                 state.goals[gi].status = GoalStatus::Completed;
                 state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                // Record milestone
+                if let Some(ref mem) = mem {
+                    use crate::memory::Memory;
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let milestone_key = format!("milestone-{}-{}", state.goals[gi].id, ts);
+                    let milestone_content = format!("Completed: {}", state.goals[gi].description);
+                    if let Err(e) = mem.store(
+                        &milestone_key,
+                        &milestone_content,
+                        crate::memory::MemoryCategory::Custom("milestone".into()),
+                        None,
+                    ).await {
+                        tracing::warn!("Failed to record milestone: {e}");
+                    }
+                }
                 let msg = format_goal_completed_message(&state.goals[gi]);
                 notify_goal_event(&config, &msg).await;
                 let _ = engine.save_state(&state).await;
@@ -1386,6 +1433,40 @@ fn ensure_consolidation_job(config: &Config) {
         }
         Err(e) => {
             tracing::warn!("Failed to create nightly consolidation job: {e}");
+        }
+    }
+}
+
+/// Ensure the daily digest job exists in the cron store.
+/// Called once on daemon startup when cron is enabled.  If the job
+/// already exists this is a no-op.
+fn ensure_daily_digest_job(config: &Config) {
+    use crate::cron::digest::DIGEST_JOB_NAME;
+
+    match crate::cron::list_jobs(config) {
+        Ok(jobs) => {
+            if jobs
+                .iter()
+                .any(|j| j.name.as_deref() == Some(DIGEST_JOB_NAME))
+            {
+                return;
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to check for digest job: {e}");
+            return;
+        }
+    }
+
+    match crate::cron::digest::create_digest_job(config) {
+        Ok(job) => {
+            tracing::info!(
+                job_id = %job.id,
+                "Auto-registered daily digest job"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create daily digest job: {e}");
         }
     }
 }
