@@ -541,9 +541,14 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Goal loop: failed to load state: {e}");
+                next_delay = idle_interval;
                 continue;
             }
         };
+
+        // Default to idle; will be shortened to active_interval at end of
+        // loop body if actionable goals remain after this cycle.
+        next_delay = idle_interval;
 
         // ── Auto-approve: promote pending low-priority goals ─────────
         if config.goal_loop.auto_approve_low_priority {
