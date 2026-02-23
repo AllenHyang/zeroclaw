@@ -22,6 +22,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         .channel_max_backoff_secs
         .max(initial_backoff);
 
+    crate::providers::reliable::init_llm_concurrency(config.reliability.max_concurrent_llm_calls);
+
     crate::health::mark_component_ok("daemon");
 
     if config.heartbeat.enabled {
@@ -457,10 +459,11 @@ async fn deliver_heartbeat(
 // ── Goal Loop Worker ─────────────────────────────────────────────
 
 /// Returns `true` if the state has goals that the loop can act on
-/// (either steps to execute or stalled goals to reflect on).
+/// (autonomous goals, stepped goals with actionable steps, or stalled goals).
 fn has_actionable_goals(state: &crate::goals::engine::GoalState) -> bool {
     use crate::goals::engine::GoalEngine;
-    GoalEngine::select_next_actionable(state).is_some()
+    GoalEngine::select_next_autonomous_goal(state).is_some()
+        || GoalEngine::select_next_actionable(state).is_some()
         || !GoalEngine::find_stalled_goals(state).is_empty()
 }
 
@@ -507,12 +510,16 @@ async fn check_network_reachable(config: &Config) -> bool {
 }
 
 async fn run_goal_loop_worker(config: Config) -> Result<()> {
-    use crate::goals::engine::{GoalEngine, GoalPriority, GoalStatus, StepStatus};
+    use crate::goals::engine::{
+        GoalEngine, GoalExecutionMode, GoalPriority, GoalStatus, StepStatus,
+    };
 
     let engine = GoalEngine::new(&config.workspace_dir);
     let interval_mins = config.goal_loop.interval_minutes.max(1);
     let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
     let step_timeout = Duration::from_secs(config.goal_loop.step_timeout_secs.max(10));
+    let autonomous_timeout = Duration::from_secs(config.goal_loop.autonomous_timeout_secs.max(30));
+    let max_total_iterations = config.goal_loop.max_total_goal_iterations;
 
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
@@ -535,16 +542,23 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
         // ── Auto-approve: promote pending low-priority goals ─────────
         if config.goal_loop.auto_approve_low_priority {
             let mut promoted = false;
+            let mode = if config.goal_loop.default_execution_mode == "stepped" {
+                GoalExecutionMode::Stepped
+            } else {
+                GoalExecutionMode::Autonomous
+            };
             for goal in &mut state.goals {
                 if goal.status == GoalStatus::Pending
                     && goal.priority == GoalPriority::Low
                     && !goal.steps.is_empty()
                 {
                     goal.status = GoalStatus::InProgress;
+                    goal.execution_mode = mode.clone();
                     goal.updated_at = chrono::Utc::now().to_rfc3339();
                     tracing::info!(
                         goal_id = %goal.id,
                         goal = %goal.description,
+                        mode = ?mode,
                         "Goal loop: auto-approved low-priority goal"
                     );
                     promoted = true;
@@ -754,7 +768,198 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             }
         }
 
-        // ── Normal step execution ───────────────────────────────────
+        // ── Autonomous goal execution ──────────────────────────────
+        let mut autonomous_executed: u32 = 0;
+        while autonomous_executed < max_steps {
+            let Some(gi) = GoalEngine::select_next_autonomous_goal(&state) else {
+                break;
+            };
+
+            let goal_id = state.goals[gi].id.clone();
+
+            // Budget check: auto-block if total_iterations exceeded
+            if state.goals[gi].total_iterations >= max_total_iterations {
+                state.goals[gi].status = GoalStatus::Blocked;
+                state.goals[gi].last_error = Some(format!(
+                    "total iteration budget exhausted ({} >= {max_total_iterations})",
+                    state.goals[gi].total_iterations,
+                ));
+                state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = engine.save_state(&state).await;
+                notify_goal_event(
+                    &config,
+                    &format!(
+                        "Goal '{}' auto-blocked: iteration budget exhausted",
+                        state.goals[gi].description,
+                    ),
+                )
+                .await;
+                break;
+            }
+
+            tracing::info!(
+                goal_id = %goal_id,
+                goal = %state.goals[gi].description,
+                iteration = state.goals[gi].total_iterations,
+                "Goal loop: running autonomous session"
+            );
+
+            crate::health::set_component_activity(
+                "goal-loop",
+                Some(&format!(
+                    "autonomous: {}",
+                    crate::util::truncate_with_ellipsis(&state.goals[gi].description, 60)
+                )),
+            );
+
+            let prompt = GoalEngine::build_autonomous_prompt(&state.goals[gi], &state);
+            let temp = config.default_temperature;
+            let started_at = chrono::Utc::now();
+
+            let result = tokio::time::timeout(
+                autonomous_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    temp,
+                    vec![],
+                    false,
+                    true, // enable_state_reconciliation
+                    Some("goal-loop"),
+                ),
+            )
+            .await;
+
+            let finished_at = chrono::Utc::now();
+            let duration_ms = (finished_at - started_at).num_milliseconds();
+            crate::health::set_component_activity("goal-loop", None);
+
+            // Record in cron_runs so consolidation can see it
+            let job_id = format!("__goal_{goal_id}");
+
+            // Reload state — the agent may have modified goals.json directly
+            state = match engine.load_state().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Goal loop: failed to reload state after autonomous session: {e}"
+                    );
+                    break;
+                }
+            };
+
+            // Re-locate goal by id (index may have shifted)
+            let Some(gi) = state.goals.iter().position(|g| g.id == goal_id) else {
+                tracing::warn!("Goal loop: goal {goal_id} disappeared after autonomous session");
+                break;
+            };
+
+            // Approximate iteration cost: use agent max_tool_iterations as upper bound
+            let iter_cost = config.agent.max_tool_iterations as u32;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let status = GoalEngine::interpret_autonomous_result(&output);
+                    let wm = GoalEngine::extract_working_memory(&output, 2000);
+                    state.goals[gi].working_memory = Some(wm);
+                    state.goals[gi].total_iterations += iter_cost;
+                    state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+
+                    let _ = crate::cron::record_run(
+                        &config,
+                        &job_id,
+                        started_at,
+                        finished_at,
+                        "ok",
+                        Some(&crate::util::truncate_with_ellipsis(&output, 500)),
+                        duration_ms,
+                    );
+
+                    match status {
+                        crate::goals::engine::AutonomousSessionStatus::Completed => {
+                            state.goals[gi].status = GoalStatus::Completed;
+                            state.goals[gi].last_error = None;
+                            let _ = engine.save_state(&state).await;
+                            crate::health::mark_component_ok("goal-loop");
+                            notify_goal_event(
+                                &config,
+                                &format!(
+                                    "Goal completed (autonomous): {}",
+                                    state.goals[gi].description,
+                                ),
+                            )
+                            .await;
+                        }
+                        crate::goals::engine::AutonomousSessionStatus::InProgress => {
+                            state.goals[gi].last_error = None;
+                            let _ = engine.save_state(&state).await;
+                            crate::health::mark_component_ok("goal-loop");
+                            tracing::info!(
+                                goal_id = %goal_id,
+                                "Autonomous session: goal still in progress"
+                            );
+                        }
+                        crate::goals::engine::AutonomousSessionStatus::Blocked(reason) => {
+                            state.goals[gi].status = GoalStatus::Blocked;
+                            state.goals[gi].last_error = Some(reason.clone());
+                            let _ = engine.save_state(&state).await;
+                            notify_goal_event(
+                                &config,
+                                &format!(
+                                    "Goal '{}' blocked (autonomous): {reason}",
+                                    state.goals[gi].description,
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    let _ = crate::cron::record_run(
+                        &config,
+                        &job_id,
+                        started_at,
+                        finished_at,
+                        "error",
+                        Some(&e.to_string()),
+                        duration_ms,
+                    );
+                    state.goals[gi].working_memory = Some(format!("[session error] {e}"));
+                    state.goals[gi].total_iterations += iter_cost;
+                    let _ = engine.save_state(&state).await;
+                    tracing::warn!("Autonomous session error for goal {goal_id}: {e}");
+                    crate::health::mark_component_error("goal-loop", e.to_string());
+                    break;
+                }
+                Err(_elapsed) => {
+                    let _ = crate::cron::record_run(
+                        &config,
+                        &job_id,
+                        started_at,
+                        finished_at,
+                        "timeout",
+                        None,
+                        duration_ms,
+                    );
+                    state.goals[gi].working_memory =
+                        Some("[session timed out — will resume next cycle]".into());
+                    state.goals[gi].total_iterations += iter_cost;
+                    let _ = engine.save_state(&state).await;
+                    tracing::warn!("Autonomous session timed out for goal {goal_id}");
+                    crate::health::mark_component_error(
+                        "goal-loop",
+                        "autonomous session timed out",
+                    );
+                    break;
+                }
+            }
+
+            autonomous_executed += 1;
+        }
+
+        // ── Normal step execution (Stepped goals) ─────────────────────
         for _ in 0..max_steps {
             let Some((gi, si)) = GoalEngine::select_next_actionable(&state) else {
                 break;

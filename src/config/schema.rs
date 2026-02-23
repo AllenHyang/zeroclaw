@@ -2106,6 +2106,10 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// Maximum concurrent LLM calls across all daemon components (channel, goal-loop, cron, heartbeat).
+    /// Prevents 429 rate-limit storms when multiple components call the provider simultaneously.
+    #[serde(default = "default_max_concurrent_llm_calls")]
+    pub max_concurrent_llm_calls: usize,
 }
 
 fn default_provider_retries() -> u32 {
@@ -2132,6 +2136,10 @@ fn default_scheduler_retries() -> u32 {
     2
 }
 
+fn default_max_concurrent_llm_calls() -> usize {
+    2
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -2144,6 +2152,7 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            max_concurrent_llm_calls: default_max_concurrent_llm_calls(),
         }
     }
 }
@@ -2353,6 +2362,21 @@ pub struct GoalLoopConfig {
     /// `in_progress` without waiting for human approval.  Default: `false`.
     #[serde(default)]
     pub auto_approve_low_priority: bool,
+
+    /// Default execution mode for newly promoted goals.
+    /// `"autonomous"` (default): agent runs in a long session with intent+criteria.
+    /// `"stepped"`: legacy per-step pipeline.
+    #[serde(default = "default_execution_mode")]
+    pub default_execution_mode: String,
+
+    /// Timeout in seconds for a single autonomous session. Default: `600` (10 min).
+    #[serde(default = "default_autonomous_timeout_secs")]
+    pub autonomous_timeout_secs: u64,
+
+    /// Maximum total tool iterations across all autonomous sessions for one goal.
+    /// When exceeded the goal is auto-blocked. Default: `200`.
+    #[serde(default = "default_max_total_goal_iterations")]
+    pub max_total_goal_iterations: u32,
 }
 
 fn default_explore_cooldown_minutes() -> u32 {
@@ -2361,6 +2385,18 @@ fn default_explore_cooldown_minutes() -> u32 {
 
 fn default_max_explorations_per_day() -> u32 {
     6
+}
+
+fn default_execution_mode() -> String {
+    "autonomous".into()
+}
+
+fn default_autonomous_timeout_secs() -> u64 {
+    600
+}
+
+fn default_max_total_goal_iterations() -> u32 {
+    200
 }
 
 impl Default for GoalLoopConfig {
@@ -2376,6 +2412,9 @@ impl Default for GoalLoopConfig {
             explore_cooldown_minutes: default_explore_cooldown_minutes(),
             max_explorations_per_day: default_max_explorations_per_day(),
             auto_approve_low_priority: false,
+            default_execution_mode: default_execution_mode(),
+            autonomous_timeout_secs: default_autonomous_timeout_secs(),
+            max_total_goal_iterations: default_max_total_goal_iterations(),
         }
     }
 }

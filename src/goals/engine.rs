@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 /// Maximum retry attempts per step before marking the goal as blocked.
 const MAX_STEP_ATTEMPTS: u32 = 3;
 
+/// Maximum characters retained in `working_memory` between autonomous sessions.
+const MAX_WORKING_MEMORY_CHARS: usize = 2000;
+
+/// Default ceiling for `total_iterations` across all autonomous sessions for one goal.
+const DEFAULT_MAX_TOTAL_GOAL_ITERATIONS: u32 = 200;
+
 // ── Data Structures ─────────────────────────────────────────────
 
 /// Root state persisted to `{workspace}/state/goals.json`.
@@ -36,6 +42,23 @@ pub struct Goal {
     /// Last error encountered during step execution.
     #[serde(default)]
     pub last_error: Option<String>,
+
+    // ── Autonomous session fields ───────────────────────────────
+    /// Success criteria for autonomous mode (what "done" looks like).
+    #[serde(default)]
+    pub success_criteria: Option<String>,
+    /// Constraints the agent must respect during autonomous execution.
+    #[serde(default)]
+    pub constraints: Option<String>,
+    /// Persisted working memory from the last autonomous session.
+    #[serde(default)]
+    pub working_memory: Option<String>,
+    /// Execution mode: `autonomous` (default) or `stepped`.
+    #[serde(default)]
+    pub execution_mode: GoalExecutionMode,
+    /// Total tool iterations consumed across all autonomous sessions.
+    #[serde(default)]
+    pub total_iterations: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -84,6 +107,32 @@ impl Ord for GoalPriority {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalExecutionMode {
+    #[default]
+    Autonomous,
+    Stepped,
+}
+
+// Self-healing deserialization: unknown values → Autonomous
+impl<'de> Deserialize<'de> for GoalExecutionMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "stepped" => Self::Stepped,
+            _ => Self::Autonomous,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutonomousSessionStatus {
+    Completed,
+    InProgress,
+    Blocked(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
@@ -118,6 +167,19 @@ impl<'de> Deserialize<'de> for StepStatus {
             _ => Self::Pending,
         })
     }
+}
+
+/// Truncate a string to at most `max` characters on a char boundary.
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    // Find the largest char boundary <= max
+    let mut end = max;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 // ── GoalEngine ──────────────────────────────────────────────────
@@ -160,13 +222,18 @@ impl GoalEngine {
 
     /// Select the next actionable (goal_index, step_index) pair.
     ///
-    /// Strategy: highest-priority in-progress goal, first pending step
-    /// that hasn't exceeded `MAX_STEP_ATTEMPTS`.
+    /// Strategy: highest-priority in-progress **Stepped** goal, first pending step
+    /// that hasn't exceeded `MAX_STEP_ATTEMPTS`. Autonomous goals are skipped —
+    /// they are handled by `select_next_autonomous_goal`.
     pub fn select_next_actionable(state: &GoalState) -> Option<(usize, usize)> {
         let mut best: Option<(usize, usize, GoalPriority)> = None;
 
         for (gi, goal) in state.goals.iter().enumerate() {
             if goal.status != GoalStatus::InProgress {
+                continue;
+            }
+            // Skip autonomous goals — they use a different execution path
+            if goal.execution_mode == GoalExecutionMode::Autonomous {
                 continue;
             }
             if let Some(si) = goal
@@ -258,6 +325,175 @@ impl GoalEngine {
 
     pub fn max_step_attempts() -> u32 {
         MAX_STEP_ATTEMPTS
+    }
+
+    pub fn default_max_total_goal_iterations() -> u32 {
+        DEFAULT_MAX_TOTAL_GOAL_ITERATIONS
+    }
+
+    // ── Autonomous session support ─────────────────────────────
+
+    /// Select the highest-priority InProgress goal with `execution_mode == Autonomous`.
+    pub fn select_next_autonomous_goal(state: &GoalState) -> Option<usize> {
+        let mut best: Option<(usize, GoalPriority)> = None;
+
+        for (gi, goal) in state.goals.iter().enumerate() {
+            if goal.status != GoalStatus::InProgress {
+                continue;
+            }
+            if goal.execution_mode != GoalExecutionMode::Autonomous {
+                continue;
+            }
+            match best {
+                Some((_, ref bp)) if goal.priority <= *bp => {}
+                _ => best = Some((gi, goal.priority)),
+            }
+        }
+
+        best.map(|(gi, _)| gi)
+    }
+
+    /// Build a prompt for autonomous goal execution.
+    ///
+    /// The prompt gives the agent the goal's intent, success criteria, constraints,
+    /// working memory from the prior session, completed context, and steps as
+    /// optional reference. The agent must end with a `[GOAL_STATUS: ...]` tag.
+    pub fn build_autonomous_prompt(goal: &Goal, state: &GoalState) -> String {
+        let mut prompt = String::new();
+
+        let _ = writeln!(
+            prompt,
+            "[Autonomous Goal Session] Goal: {}\n",
+            goal.description
+        );
+
+        // Success criteria
+        if let Some(ref criteria) = goal.success_criteria {
+            let _ = writeln!(prompt, "== Success Criteria ==\n{criteria}\n");
+        }
+
+        // Constraints
+        if let Some(ref constraints) = goal.constraints {
+            let _ = writeln!(prompt, "== Constraints ==\n{constraints}\n");
+        }
+
+        // Working memory from last session
+        if let Some(ref wm) = goal.working_memory {
+            if !wm.is_empty() {
+                let _ = writeln!(prompt, "== Working Memory (from last session) ==\n{wm}\n");
+            }
+        }
+
+        // Accumulated context from completed steps
+        if !goal.context.is_empty() {
+            let _ = writeln!(prompt, "== Completed Context ==\n{}\n", goal.context);
+        }
+
+        // Steps as optional reference
+        if !goal.steps.is_empty() {
+            prompt.push_str("== Steps (reference only — you may deviate) ==\n");
+            for s in &goal.steps {
+                let tag = match s.status {
+                    StepStatus::Completed => "done",
+                    StepStatus::Failed | StepStatus::Blocked => "blocked",
+                    StepStatus::InProgress => "active",
+                    _ => "pending",
+                };
+                let result = s.result.as_deref().unwrap_or("");
+                if result.is_empty() {
+                    let _ = writeln!(prompt, "- [{tag}] {}", s.description);
+                } else {
+                    let _ = writeln!(prompt, "- [{tag}] {}: {result}", s.description);
+                }
+            }
+            prompt.push('\n');
+        }
+
+        // Last error
+        if let Some(ref err) = goal.last_error {
+            let _ = writeln!(prompt, "== Last Error ==\n{err}\n");
+        }
+
+        // Goal panorama (other goals for context)
+        Self::append_goals_by_status(&mut prompt, state);
+
+        // Session instructions
+        prompt.push_str(
+            "== Session Instructions ==\n\
+             You are running autonomously — do NOT ask the user for input.\n\
+             Work towards the goal above. Use tools as needed.\n\
+             When you finish or need to pause, end your output with EXACTLY one of:\n\
+             [GOAL_STATUS: completed]\n\
+             [GOAL_STATUS: in_progress]\n\
+             [GOAL_STATUS: blocked REASON]\n\n\
+             After the status tag, you may optionally write a brief working memory \
+             note (max ~500 chars) that will be preserved for your next session.\n\
+             This is your ONLY way to pass context to yourself across sessions.\n",
+        );
+
+        prompt
+    }
+
+    /// Parse the agent output to determine autonomous session status.
+    ///
+    /// Priority: (1) explicit `[GOAL_STATUS: ...]` tag in last 500 chars,
+    /// (2) fallback to existing `interpret_result()` heuristic (conservatively
+    /// returns InProgress rather than Completed).
+    pub fn interpret_autonomous_result(output: &str) -> AutonomousSessionStatus {
+        // Search in the tail of the output for the status tag
+        let search_region = if output.len() > 500 {
+            &output[output.len() - 500..]
+        } else {
+            output
+        };
+
+        // Look for [GOAL_STATUS: ...] — last occurrence wins
+        if let Some(pos) = search_region.rfind("[GOAL_STATUS:") {
+            let after = &search_region[pos + "[GOAL_STATUS:".len()..];
+            if let Some(end) = after.find(']') {
+                let tag_content = after[..end].trim().to_ascii_lowercase();
+                if tag_content == "completed" {
+                    return AutonomousSessionStatus::Completed;
+                } else if tag_content == "in_progress" {
+                    return AutonomousSessionStatus::InProgress;
+                } else if let Some(reason) = tag_content.strip_prefix("blocked") {
+                    let reason = reason.trim().to_string();
+                    return AutonomousSessionStatus::Blocked(if reason.is_empty() {
+                        "no reason given".into()
+                    } else {
+                        reason
+                    });
+                }
+            }
+        }
+
+        // Fallback: use existing heuristic but conservatively return InProgress
+        // (never auto-complete from heuristic alone)
+        if !Self::interpret_result(output) {
+            AutonomousSessionStatus::Blocked("heuristic detected failure indicators".into())
+        } else {
+            AutonomousSessionStatus::InProgress
+        }
+    }
+
+    /// Extract working memory from the agent output.
+    ///
+    /// If a `[GOAL_STATUS: ...]` tag exists, take text after the closing `]`.
+    /// Otherwise, truncate the entire output.
+    pub fn extract_working_memory(output: &str, max_chars: usize) -> String {
+        // Find the last [GOAL_STATUS: ...] tag
+        if let Some(pos) = output.rfind("[GOAL_STATUS:") {
+            if let Some(end_bracket) = output[pos..].find(']') {
+                let after = &output[pos + end_bracket + 1..];
+                let trimmed = after.trim();
+                if !trimmed.is_empty() {
+                    return truncate_str(trimmed, max_chars).to_string();
+                }
+            }
+        }
+
+        // No tag or nothing after tag: truncate the whole output
+        truncate_str(output.trim(), max_chars).to_string()
     }
 
     /// Build an exploration prompt for when no goals are active.
@@ -378,18 +614,21 @@ impl GoalEngine {
         buf.push('\n');
     }
 
-    /// Find in-progress goals that have no actionable steps remaining.
+    /// Find in-progress **Stepped** goals that have no actionable steps remaining.
     ///
     /// A goal is "stalled" when it is `InProgress` but every step is either
     /// completed, blocked, or has exhausted its retry attempts. These goals
     /// need a reflection session to decide: add new steps, mark completed,
     /// mark blocked, or escalate to the user.
+    ///
+    /// Autonomous goals are excluded — they manage their own lifecycle.
     pub fn find_stalled_goals(state: &GoalState) -> Vec<usize> {
         state
             .goals
             .iter()
             .enumerate()
             .filter(|(_, g)| g.status == GoalStatus::InProgress)
+            .filter(|(_, g)| g.execution_mode != GoalExecutionMode::Autonomous)
             .filter(|(_, g)| {
                 !g.steps.is_empty()
                     && !g
@@ -451,17 +690,76 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Build a Stepped goal for existing step-based tests.
+    fn make_goal(
+        id: &str,
+        desc: &str,
+        status: GoalStatus,
+        priority: GoalPriority,
+        steps: Vec<Step>,
+        context: &str,
+        last_error: Option<String>,
+    ) -> Goal {
+        Goal {
+            id: id.into(),
+            description: desc.into(),
+            status,
+            priority,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps,
+            context: context.into(),
+            last_error,
+            success_criteria: None,
+            constraints: None,
+            working_memory: None,
+            execution_mode: GoalExecutionMode::Stepped,
+            total_iterations: 0,
+        }
+    }
+
+    /// Build an Autonomous goal for autonomous session tests.
+    #[allow(clippy::too_many_arguments)]
+    fn make_autonomous_goal(
+        id: &str,
+        desc: &str,
+        status: GoalStatus,
+        priority: GoalPriority,
+        steps: Vec<Step>,
+        context: &str,
+        last_error: Option<String>,
+        success_criteria: Option<&str>,
+        constraints: Option<&str>,
+        working_memory: Option<&str>,
+        total_iterations: u32,
+    ) -> Goal {
+        Goal {
+            id: id.into(),
+            description: desc.into(),
+            status,
+            priority,
+            created_at: String::new(),
+            updated_at: String::new(),
+            steps,
+            context: context.into(),
+            last_error,
+            success_criteria: success_criteria.map(String::from),
+            constraints: constraints.map(String::from),
+            working_memory: working_memory.map(String::from),
+            execution_mode: GoalExecutionMode::Autonomous,
+            total_iterations,
+        }
+    }
+
     fn sample_goal_state() -> GoalState {
         GoalState {
             goals: vec![
-                Goal {
-                    id: "g1".into(),
-                    description: "Build automation platform".into(),
-                    status: GoalStatus::InProgress,
-                    priority: GoalPriority::High,
-                    created_at: "2026-01-01T00:00:00Z".into(),
-                    updated_at: "2026-01-01T00:00:00Z".into(),
-                    steps: vec![
+                make_goal(
+                    "g1",
+                    "Build automation platform",
+                    GoalStatus::InProgress,
+                    GoalPriority::High,
+                    vec![
                         Step {
                             id: "s1".into(),
                             description: "Research tools".into(),
@@ -484,26 +782,24 @@ mod tests {
                             attempts: 0,
                         },
                     ],
-                    context: "Using Python + Selenium".into(),
-                    last_error: None,
-                },
-                Goal {
-                    id: "g2".into(),
-                    description: "Learn Rust".into(),
-                    status: GoalStatus::InProgress,
-                    priority: GoalPriority::Medium,
-                    created_at: "2026-01-02T00:00:00Z".into(),
-                    updated_at: "2026-01-02T00:00:00Z".into(),
-                    steps: vec![Step {
+                    "Using Python + Selenium",
+                    None,
+                ),
+                make_goal(
+                    "g2",
+                    "Learn Rust",
+                    GoalStatus::InProgress,
+                    GoalPriority::Medium,
+                    vec![Step {
                         id: "s1".into(),
                         description: "Read the book".into(),
                         status: StepStatus::Pending,
                         result: None,
                         attempts: 0,
                     }],
-                    context: String::new(),
-                    last_error: None,
-                },
+                    "",
+                    None,
+                ),
             ],
         }
     }
@@ -660,14 +956,12 @@ target = "oc_test"
     #[test]
     fn find_stalled_goals_detects_exhausted_steps() {
         let state = GoalState {
-            goals: vec![Goal {
-                id: "g1".into(),
-                description: "Stalled goal".into(),
-                status: GoalStatus::InProgress,
-                priority: GoalPriority::High,
-                created_at: String::new(),
-                updated_at: String::new(),
-                steps: vec![
+            goals: vec![make_goal(
+                "g1",
+                "Stalled goal",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![
                     Step {
                         id: "s1".into(),
                         description: "Done step".into(),
@@ -683,9 +977,9 @@ target = "oc_test"
                         attempts: 3, // >= MAX_STEP_ATTEMPTS
                     },
                 ],
-                context: String::new(),
-                last_error: Some("step failed 3 times".into()),
-            }],
+                "",
+                Some("step failed 3 times".into()),
+            )],
         };
 
         let stalled = GoalEngine::find_stalled_goals(&state);
@@ -702,23 +996,21 @@ target = "oc_test"
     #[test]
     fn find_stalled_goals_ignores_completed_goals() {
         let state = GoalState {
-            goals: vec![Goal {
-                id: "g1".into(),
-                description: "Done".into(),
-                status: GoalStatus::Completed,
-                priority: GoalPriority::Medium,
-                created_at: String::new(),
-                updated_at: String::new(),
-                steps: vec![Step {
+            goals: vec![make_goal(
+                "g1",
+                "Done",
+                GoalStatus::Completed,
+                GoalPriority::Medium,
+                vec![Step {
                     id: "s1".into(),
                     description: "Only step".into(),
                     status: StepStatus::Completed,
                     result: Some("ok".into()),
                     attempts: 1,
                 }],
-                context: String::new(),
-                last_error: None,
-            }],
+                "",
+                None,
+            )],
         };
 
         let stalled = GoalEngine::find_stalled_goals(&state);
@@ -727,14 +1019,12 @@ target = "oc_test"
 
     #[test]
     fn build_reflection_prompt_includes_step_summary() {
-        let goal = Goal {
-            id: "g1".into(),
-            description: "Test reflection".into(),
-            status: GoalStatus::InProgress,
-            priority: GoalPriority::High,
-            created_at: String::new(),
-            updated_at: String::new(),
-            steps: vec![
+        let goal = make_goal(
+            "g1",
+            "Test reflection",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![
                 Step {
                     id: "s1".into(),
                     description: "Completed step".into(),
@@ -750,9 +1040,9 @@ target = "oc_test"
                     attempts: 3,
                 },
             ],
-            context: "some context".into(),
-            last_error: Some("policy_denied".into()),
-        };
+            "some context",
+            Some("policy_denied".into()),
+        );
 
         let prompt = GoalEngine::build_reflection_prompt(&goal);
         assert!(prompt.contains("[Goal Reflection]"));
@@ -834,39 +1124,37 @@ target = "oc_test"
     #[test]
     fn find_stalled_goals_empty_steps_not_stalled() {
         let state = GoalState {
-            goals: vec![Goal {
-                id: "g1".into(),
-                description: "No steps".into(),
-                status: GoalStatus::InProgress,
-                priority: GoalPriority::High,
-                created_at: String::new(),
-                updated_at: String::new(),
-                steps: vec![],
-                context: String::new(),
-                last_error: None,
-            }],
+            goals: vec![make_goal(
+                "g1",
+                "No steps",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![],
+                "",
+                None,
+            )],
         };
         assert!(GoalEngine::find_stalled_goals(&state).is_empty());
     }
 
     #[test]
     fn find_stalled_goals_multiple_stalled() {
-        let stalled_goal = |id: &str| Goal {
-            id: id.into(),
-            description: format!("Stalled {id}"),
-            status: GoalStatus::InProgress,
-            priority: GoalPriority::Medium,
-            created_at: String::new(),
-            updated_at: String::new(),
-            steps: vec![Step {
-                id: "s1".into(),
-                description: "Exhausted".into(),
-                status: StepStatus::Pending,
-                result: None,
-                attempts: MAX_STEP_ATTEMPTS,
-            }],
-            context: String::new(),
-            last_error: None,
+        let stalled_goal = |id: &str| {
+            make_goal(
+                id,
+                &format!("Stalled {id}"),
+                GoalStatus::InProgress,
+                GoalPriority::Medium,
+                vec![Step {
+                    id: "s1".into(),
+                    description: "Exhausted".into(),
+                    status: StepStatus::Pending,
+                    result: None,
+                    attempts: MAX_STEP_ATTEMPTS,
+                }],
+                "",
+                None,
+            )
         };
         let state = GoalState {
             goals: vec![stalled_goal("g1"), stalled_goal("g2"), stalled_goal("g3")],
@@ -877,14 +1165,12 @@ target = "oc_test"
     #[test]
     fn find_stalled_goals_all_steps_completed_is_stalled() {
         let state = GoalState {
-            goals: vec![Goal {
-                id: "g1".into(),
-                description: "All done but still in-progress".into(),
-                status: GoalStatus::InProgress,
-                priority: GoalPriority::High,
-                created_at: String::new(),
-                updated_at: String::new(),
-                steps: vec![
+            goals: vec![make_goal(
+                "g1",
+                "All done but still in-progress",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![
                     Step {
                         id: "s1".into(),
                         description: "Done".into(),
@@ -900,9 +1186,9 @@ target = "oc_test"
                         attempts: 1,
                     },
                 ],
-                context: String::new(),
-                last_error: None,
-            }],
+                "",
+                None,
+            )],
         };
         assert_eq!(GoalEngine::find_stalled_goals(&state), vec![0]);
     }
@@ -910,14 +1196,12 @@ target = "oc_test"
     #[test]
     fn find_stalled_goals_mix_completed_and_blocked_steps() {
         let state = GoalState {
-            goals: vec![Goal {
-                id: "g1".into(),
-                description: "Mixed".into(),
-                status: GoalStatus::InProgress,
-                priority: GoalPriority::High,
-                created_at: String::new(),
-                updated_at: String::new(),
-                steps: vec![
+            goals: vec![make_goal(
+                "g1",
+                "Mixed",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![
                     Step {
                         id: "s1".into(),
                         description: "Done".into(),
@@ -933,9 +1217,9 @@ target = "oc_test"
                         attempts: 0,
                     },
                 ],
-                context: String::new(),
-                last_error: None,
-            }],
+                "",
+                None,
+            )],
         };
         assert_eq!(GoalEngine::find_stalled_goals(&state), vec![0]);
     }
@@ -944,60 +1228,54 @@ target = "oc_test"
 
     #[test]
     fn build_reflection_prompt_empty_context_omits_section() {
-        let goal = Goal {
-            id: "g1".into(),
-            description: "Empty context".into(),
-            status: GoalStatus::InProgress,
-            priority: GoalPriority::High,
-            created_at: String::new(),
-            updated_at: String::new(),
-            steps: vec![Step {
+        let goal = make_goal(
+            "g1",
+            "Empty context",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![Step {
                 id: "s1".into(),
                 description: "Step".into(),
                 status: StepStatus::Completed,
                 result: Some("ok".into()),
                 attempts: 1,
             }],
-            context: String::new(),
-            last_error: None,
-        };
+            "",
+            None,
+        );
         let prompt = GoalEngine::build_reflection_prompt(&goal);
         assert!(!prompt.contains("Accumulated context"));
     }
 
     #[test]
     fn build_reflection_prompt_no_last_error_omits_section() {
-        let goal = Goal {
-            id: "g1".into(),
-            description: "No error".into(),
-            status: GoalStatus::InProgress,
-            priority: GoalPriority::High,
-            created_at: String::new(),
-            updated_at: String::new(),
-            steps: vec![Step {
+        let goal = make_goal(
+            "g1",
+            "No error",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![Step {
                 id: "s1".into(),
                 description: "Step".into(),
                 status: StepStatus::Completed,
                 result: Some("ok".into()),
                 attempts: 1,
             }],
-            context: "some ctx".into(),
-            last_error: None,
-        };
+            "some ctx",
+            None,
+        );
         let prompt = GoalEngine::build_reflection_prompt(&goal);
         assert!(!prompt.contains("Last error"));
     }
 
     #[test]
     fn build_reflection_prompt_all_done_tags() {
-        let goal = Goal {
-            id: "g1".into(),
-            description: "All done".into(),
-            status: GoalStatus::InProgress,
-            priority: GoalPriority::High,
-            created_at: String::new(),
-            updated_at: String::new(),
-            steps: vec![
+        let goal = make_goal(
+            "g1",
+            "All done",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![
                 Step {
                     id: "s1".into(),
                     description: "First".into(),
@@ -1013,9 +1291,9 @@ target = "oc_test"
                     attempts: 1,
                 },
             ],
-            context: String::new(),
-            last_error: None,
-        };
+            "",
+            None,
+        );
         let prompt = GoalEngine::build_reflection_prompt(&goal);
         assert!(prompt.contains("[done] First"));
         assert!(prompt.contains("[done] Second"));
@@ -1073,39 +1351,33 @@ target = "oc_test"
     fn exploration_prompt_mixed_state() {
         let state = GoalState {
             goals: vec![
-                Goal {
-                    id: "g1".into(),
-                    description: "Completed task".into(),
-                    status: GoalStatus::Completed,
-                    priority: GoalPriority::High,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    steps: vec![],
-                    context: String::new(),
-                    last_error: None,
-                },
-                Goal {
-                    id: "g2".into(),
-                    description: "Blocked task".into(),
-                    status: GoalStatus::Blocked,
-                    priority: GoalPriority::Medium,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    steps: vec![],
-                    context: String::new(),
-                    last_error: Some("network timeout".into()),
-                },
-                Goal {
-                    id: "g3".into(),
-                    description: "Pending task".into(),
-                    status: GoalStatus::Pending,
-                    priority: GoalPriority::Low,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    steps: vec![],
-                    context: String::new(),
-                    last_error: None,
-                },
+                make_goal(
+                    "g1",
+                    "Completed task",
+                    GoalStatus::Completed,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                ),
+                make_goal(
+                    "g2",
+                    "Blocked task",
+                    GoalStatus::Blocked,
+                    GoalPriority::Medium,
+                    vec![],
+                    "",
+                    Some("network timeout".into()),
+                ),
+                make_goal(
+                    "g3",
+                    "Pending task",
+                    GoalStatus::Pending,
+                    GoalPriority::Low,
+                    vec![],
+                    "",
+                    None,
+                ),
             ],
         };
         let prompt = GoalEngine::build_exploration_prompt(&state);
@@ -1118,28 +1390,24 @@ target = "oc_test"
     fn exploration_prompt_blocked_goals_include_last_error() {
         let state = GoalState {
             goals: vec![
-                Goal {
-                    id: "g1".into(),
-                    description: "Blocked with error".into(),
-                    status: GoalStatus::Blocked,
-                    priority: GoalPriority::High,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    steps: vec![],
-                    context: String::new(),
-                    last_error: Some("API rate limit".into()),
-                },
-                Goal {
-                    id: "g2".into(),
-                    description: "Blocked no error".into(),
-                    status: GoalStatus::Blocked,
-                    priority: GoalPriority::Low,
-                    created_at: String::new(),
-                    updated_at: String::new(),
-                    steps: vec![],
-                    context: String::new(),
-                    last_error: None,
-                },
+                make_goal(
+                    "g1",
+                    "Blocked with error",
+                    GoalStatus::Blocked,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    Some("API rate limit".into()),
+                ),
+                make_goal(
+                    "g2",
+                    "Blocked no error",
+                    GoalStatus::Blocked,
+                    GoalPriority::Low,
+                    vec![],
+                    "",
+                    None,
+                ),
             ],
         };
         let prompt = GoalEngine::build_exploration_prompt(&state);
@@ -1173,6 +1441,9 @@ max_explorations_per_day = 4
         assert_eq!(config.explore_cooldown_minutes, 60);
         assert_eq!(config.max_explorations_per_day, 6);
         assert!(!config.auto_approve_low_priority);
+        assert_eq!(config.default_execution_mode, "autonomous");
+        assert_eq!(config.autonomous_timeout_secs, 600);
+        assert_eq!(config.max_total_goal_iterations, 200);
     }
 
     #[test]
@@ -1189,6 +1460,10 @@ max_steps_per_cycle = 3
         assert_eq!(config.explore_cooldown_minutes, 60);
         assert_eq!(config.max_explorations_per_day, 6);
         assert!(!config.auto_approve_low_priority);
+        // New autonomous fields have defaults when not present
+        assert_eq!(config.default_execution_mode, "autonomous");
+        assert_eq!(config.autonomous_timeout_secs, 600);
+        assert_eq!(config.max_total_goal_iterations, 200);
     }
 
     #[test]
@@ -1226,5 +1501,572 @@ auto_approve_low_priority = true
             prompt.contains("directions_to_deprioritize"),
             "exploration prompt should mention deprioritize list"
         );
+    }
+
+    // ── GoalExecutionMode serde tests ──────────────────────────
+
+    #[test]
+    fn execution_mode_serde_roundtrip() {
+        let auto = GoalExecutionMode::Autonomous;
+        let json = serde_json::to_string(&auto).unwrap();
+        assert_eq!(json, "\"autonomous\"");
+        let parsed: GoalExecutionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, GoalExecutionMode::Autonomous);
+
+        let stepped = GoalExecutionMode::Stepped;
+        let json = serde_json::to_string(&stepped).unwrap();
+        assert_eq!(json, "\"stepped\"");
+        let parsed: GoalExecutionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, GoalExecutionMode::Stepped);
+    }
+
+    #[test]
+    fn execution_mode_self_healing_unknown() {
+        for variant in &["\"unknown\"", "\"legacy\"", "\"AUTONOMOUS\"", "\"\""] {
+            let parsed: GoalExecutionMode =
+                serde_json::from_str(variant).unwrap_or_else(|e| panic!("{variant}: {e}"));
+            assert_eq!(parsed, GoalExecutionMode::Autonomous);
+        }
+    }
+
+    #[test]
+    fn execution_mode_default_is_autonomous() {
+        assert_eq!(GoalExecutionMode::default(), GoalExecutionMode::Autonomous);
+    }
+
+    #[test]
+    fn goal_backward_compat_no_autonomous_fields() {
+        let json = r#"{
+            "id": "g1",
+            "description": "Legacy goal",
+            "status": "in_progress",
+            "steps": []
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert_eq!(goal.execution_mode, GoalExecutionMode::Autonomous);
+        assert_eq!(goal.total_iterations, 0);
+        assert!(goal.success_criteria.is_none());
+        assert!(goal.constraints.is_none());
+        assert!(goal.working_memory.is_none());
+    }
+
+    #[test]
+    fn goal_with_autonomous_fields_roundtrip() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Autonomous test",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+            Some("all tests pass"),
+            Some("max 10 tool calls"),
+            Some("last session: compiled OK"),
+            42,
+        );
+        let json = serde_json::to_string_pretty(&goal).unwrap();
+        let parsed: Goal = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.execution_mode, GoalExecutionMode::Autonomous);
+        assert_eq!(parsed.total_iterations, 42);
+        assert_eq!(parsed.success_criteria.as_deref(), Some("all tests pass"));
+        assert_eq!(parsed.constraints.as_deref(), Some("max 10 tool calls"));
+        assert_eq!(
+            parsed.working_memory.as_deref(),
+            Some("last session: compiled OK")
+        );
+    }
+
+    // ── select_next_autonomous_goal tests ───────────────────────
+
+    #[test]
+    fn select_autonomous_goal_picks_highest_priority() {
+        let state = GoalState {
+            goals: vec![
+                make_autonomous_goal(
+                    "g1",
+                    "Low auto",
+                    GoalStatus::InProgress,
+                    GoalPriority::Low,
+                    vec![],
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+                make_autonomous_goal(
+                    "g2",
+                    "High auto",
+                    GoalStatus::InProgress,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            ],
+        };
+        assert_eq!(GoalEngine::select_next_autonomous_goal(&state), Some(1));
+    }
+
+    #[test]
+    fn select_autonomous_goal_skips_stepped() {
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g1",
+                "Stepped goal",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![],
+                "",
+                None,
+            )],
+        };
+        assert!(GoalEngine::select_next_autonomous_goal(&state).is_none());
+    }
+
+    #[test]
+    fn select_autonomous_goal_skips_non_in_progress() {
+        let state = GoalState {
+            goals: vec![
+                make_autonomous_goal(
+                    "g1",
+                    "Completed",
+                    GoalStatus::Completed,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+                make_autonomous_goal(
+                    "g2",
+                    "Blocked",
+                    GoalStatus::Blocked,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+                make_autonomous_goal(
+                    "g3",
+                    "Pending",
+                    GoalStatus::Pending,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                ),
+            ],
+        };
+        assert!(GoalEngine::select_next_autonomous_goal(&state).is_none());
+    }
+
+    #[test]
+    fn select_autonomous_goal_empty_state() {
+        let state = GoalState::default();
+        assert!(GoalEngine::select_next_autonomous_goal(&state).is_none());
+    }
+
+    // ── select_next_actionable skips autonomous goals ───────────
+
+    #[test]
+    fn select_next_actionable_skips_autonomous_goals() {
+        let state = GoalState {
+            goals: vec![make_autonomous_goal(
+                "g1",
+                "Auto goal with steps",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![Step {
+                    id: "s1".into(),
+                    description: "A step".into(),
+                    status: StepStatus::Pending,
+                    result: None,
+                    attempts: 0,
+                }],
+                "",
+                None,
+                None,
+                None,
+                None,
+                0,
+            )],
+        };
+        // select_next_actionable only picks Stepped goals
+        assert!(GoalEngine::select_next_actionable(&state).is_none());
+        // select_next_autonomous_goal does find it
+        assert_eq!(GoalEngine::select_next_autonomous_goal(&state), Some(0));
+    }
+
+    // ── find_stalled_goals skips autonomous goals ────────────────
+
+    #[test]
+    fn find_stalled_goals_skips_autonomous_goals() {
+        let state = GoalState {
+            goals: vec![make_autonomous_goal(
+                "g1",
+                "Auto goal all steps done",
+                GoalStatus::InProgress,
+                GoalPriority::High,
+                vec![Step {
+                    id: "s1".into(),
+                    description: "Done".into(),
+                    status: StepStatus::Completed,
+                    result: Some("ok".into()),
+                    attempts: 1,
+                }],
+                "",
+                None,
+                None,
+                None,
+                None,
+                0,
+            )],
+        };
+        // Autonomous goals are not considered stalled
+        assert!(GoalEngine::find_stalled_goals(&state).is_empty());
+    }
+
+    // ── build_autonomous_prompt tests ────────────────────────────
+
+    #[test]
+    fn autonomous_prompt_basic() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Deploy service",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(prompt.contains("[Autonomous Goal Session]"));
+        assert!(prompt.contains("Deploy service"));
+        assert!(prompt.contains("[GOAL_STATUS:"));
+        assert!(prompt.contains("do NOT ask the user"));
+    }
+
+    #[test]
+    fn autonomous_prompt_with_criteria_and_constraints() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Build feature",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+            Some("all tests pass and CI green"),
+            Some("do not modify config.toml"),
+            None,
+            0,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(prompt.contains("== Success Criteria =="));
+        assert!(prompt.contains("all tests pass and CI green"));
+        assert!(prompt.contains("== Constraints =="));
+        assert!(prompt.contains("do not modify config.toml"));
+    }
+
+    #[test]
+    fn autonomous_prompt_with_working_memory() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Continue work",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+            None,
+            None,
+            Some("last time: fixed 3 of 5 tests"),
+            10,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(prompt.contains("== Working Memory (from last session) =="));
+        assert!(prompt.contains("last time: fixed 3 of 5 tests"));
+    }
+
+    #[test]
+    fn autonomous_prompt_with_steps_as_reference() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Multi-step",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![
+                Step {
+                    id: "s1".into(),
+                    description: "Research".into(),
+                    status: StepStatus::Completed,
+                    result: Some("found 3 options".into()),
+                    attempts: 1,
+                },
+                Step {
+                    id: "s2".into(),
+                    description: "Implement".into(),
+                    status: StepStatus::Pending,
+                    result: None,
+                    attempts: 0,
+                },
+            ],
+            "research done",
+            None,
+            None,
+            None,
+            None,
+            5,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(prompt.contains("== Steps (reference only"));
+        assert!(prompt.contains("[done] Research: found 3 options"));
+        assert!(prompt.contains("[pending] Implement"));
+        assert!(prompt.contains("== Completed Context =="));
+    }
+
+    #[test]
+    fn autonomous_prompt_with_last_error() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "Retry",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            Some("connection refused".into()),
+            None,
+            None,
+            None,
+            0,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(prompt.contains("== Last Error =="));
+        assert!(prompt.contains("connection refused"));
+    }
+
+    #[test]
+    fn autonomous_prompt_empty_working_memory_omitted() {
+        let goal = make_autonomous_goal(
+            "g1",
+            "No WM",
+            GoalStatus::InProgress,
+            GoalPriority::High,
+            vec![],
+            "",
+            None,
+            None,
+            None,
+            Some(""),
+            0,
+        );
+        let state = GoalState {
+            goals: vec![goal.clone()],
+        };
+        let prompt = GoalEngine::build_autonomous_prompt(&goal, &state);
+        assert!(!prompt.contains("Working Memory"));
+    }
+
+    // ── interpret_autonomous_result tests ─────────────────────────
+
+    #[test]
+    fn interpret_autonomous_completed() {
+        let output = "I did the work.\n[GOAL_STATUS: completed]";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::Completed,
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_in_progress() {
+        let output = "Made progress, more to do.\n[GOAL_STATUS: in_progress]";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::InProgress,
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_blocked() {
+        let output = "Need API key.\n[GOAL_STATUS: blocked missing API credentials]";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::Blocked("missing api credentials".into()),
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_blocked_no_reason() {
+        let output = "Stuck.\n[GOAL_STATUS: blocked]";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::Blocked("no reason given".into()),
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_last_tag_wins() {
+        let output = "[GOAL_STATUS: in_progress]\nActually done.\n[GOAL_STATUS: completed]";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::Completed,
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_fallback_success() {
+        let output = "I did everything correctly and deployed.";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::InProgress,
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_fallback_failure() {
+        let output = "Failed to connect to database.";
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(output),
+            AutonomousSessionStatus::Blocked("heuristic detected failure indicators".into()),
+        );
+    }
+
+    #[test]
+    fn interpret_autonomous_tag_in_long_output() {
+        let mut output = "x".repeat(1000);
+        output.push_str("\n[GOAL_STATUS: completed]");
+        assert_eq!(
+            GoalEngine::interpret_autonomous_result(&output),
+            AutonomousSessionStatus::Completed,
+        );
+    }
+
+    // ── extract_working_memory tests ─────────────────────────────
+
+    #[test]
+    fn extract_wm_after_tag() {
+        let output = "Work done.\n[GOAL_STATUS: completed]\nRemember: file.rs line 42 needs fix";
+        let wm = GoalEngine::extract_working_memory(output, 2000);
+        assert_eq!(wm, "Remember: file.rs line 42 needs fix");
+    }
+
+    #[test]
+    fn extract_wm_no_tag() {
+        let output = "Just some output with no tag";
+        let wm = GoalEngine::extract_working_memory(output, 2000);
+        assert_eq!(wm, "Just some output with no tag");
+    }
+
+    #[test]
+    fn extract_wm_truncates() {
+        let output = "No tag. ".repeat(500);
+        let wm = GoalEngine::extract_working_memory(&output, 50);
+        assert!(wm.len() <= 50);
+    }
+
+    #[test]
+    fn extract_wm_empty_after_tag() {
+        let output = "Done.\n[GOAL_STATUS: completed]";
+        let wm = GoalEngine::extract_working_memory(output, 2000);
+        // Nothing after tag, so falls through to truncating whole output
+        assert_eq!(wm, output.trim());
+    }
+
+    #[test]
+    fn extract_wm_tag_with_only_whitespace_after() {
+        let output = "Done.\n[GOAL_STATUS: completed]   \n  ";
+        let wm = GoalEngine::extract_working_memory(output, 2000);
+        // Only whitespace after tag, falls through
+        assert_eq!(wm, output.trim());
+    }
+
+    // ── GoalLoopConfig autonomous fields serde ───────────────────
+
+    #[test]
+    fn goal_loop_config_autonomous_fields_serde() {
+        let toml_str = r#"
+enabled = true
+interval_minutes = 10
+step_timeout_secs = 120
+max_steps_per_cycle = 3
+default_execution_mode = "stepped"
+autonomous_timeout_secs = 300
+max_total_goal_iterations = 100
+"#;
+        let config: crate::config::GoalLoopConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_execution_mode, "stepped");
+        assert_eq!(config.autonomous_timeout_secs, 300);
+        assert_eq!(config.max_total_goal_iterations, 100);
+    }
+
+    #[test]
+    fn goal_loop_config_autonomous_fields_defaults() {
+        let toml_str = r#"
+enabled = true
+interval_minutes = 10
+step_timeout_secs = 120
+max_steps_per_cycle = 3
+"#;
+        let config: crate::config::GoalLoopConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.default_execution_mode, "autonomous");
+        assert_eq!(config.autonomous_timeout_secs, 600);
+        assert_eq!(config.max_total_goal_iterations, 200);
+    }
+
+    // ── truncate_str tests ───────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii() {
+        assert_eq!(super::truncate_str("hello world", 5), "hello");
+        assert_eq!(super::truncate_str("hello", 10), "hello");
+        assert_eq!(super::truncate_str("", 5), "");
+    }
+
+    #[test]
+    fn truncate_str_multibyte() {
+        // Each CJK char is 3 bytes
+        let s = "你好世界"; // 12 bytes
+        let t = super::truncate_str(s, 7);
+        // Should truncate to at most 7 bytes = 2 full chars (6 bytes)
+        assert_eq!(t, "你好");
+        assert!(t.len() <= 7);
     }
 }
