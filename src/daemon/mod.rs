@@ -860,23 +860,66 @@ async fn run_goal_loop_worker(config: Config) -> Result<()> {
             let iter_cost = config.agent.max_tool_iterations as u32;
 
             // Check if the agent already changed the goal status via state
-            // reconciliation (directly editing goals.json). If so, trust that
-            // over output-text parsing.
+            // reconciliation (directly editing goals.json). If so, handle
+            // notification immediately regardless of how the session ended
+            // (success, error, or timeout).
             let agent_reconciled_status = state.goals[gi].status.clone();
+            if agent_reconciled_status == GoalStatus::Completed
+                || agent_reconciled_status == GoalStatus::Blocked
+            {
+                state.goals[gi].total_iterations += iter_cost;
+                state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = engine.save_state(&state).await;
+
+                let (cron_status, cron_output) = match &result {
+                    Ok(Ok(output)) => {
+                        ("ok", Some(crate::util::truncate_with_ellipsis(output, 500)))
+                    }
+                    Ok(Err(e)) => ("error", Some(e.to_string())),
+                    Err(_) => ("timeout", None),
+                };
+                let _ = crate::cron::record_run(
+                    &config,
+                    &job_id,
+                    started_at,
+                    finished_at,
+                    cron_status,
+                    cron_output.as_deref(),
+                    duration_ms,
+                );
+
+                if agent_reconciled_status == GoalStatus::Completed {
+                    crate::health::mark_component_ok("goal-loop");
+                    notify_goal_event(
+                        &config,
+                        &format!(
+                            "Goal completed (autonomous): {}",
+                            state.goals[gi].description,
+                        ),
+                    )
+                    .await;
+                } else {
+                    let reason = state.goals[gi]
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("marked blocked by agent");
+                    notify_goal_event(
+                        &config,
+                        &format!(
+                            "Goal '{}' blocked (autonomous): {reason}",
+                            state.goals[gi].description,
+                        ),
+                    )
+                    .await;
+                }
+                // Goal is done, move on to next goal
+                autonomous_executed += 1;
+                continue;
+            }
 
             match result {
                 Ok(Ok(output)) => {
-                    let status = if agent_reconciled_status == GoalStatus::Completed {
-                        crate::goals::engine::AutonomousSessionStatus::Completed
-                    } else if agent_reconciled_status == GoalStatus::Blocked {
-                        let reason = state.goals[gi]
-                            .last_error
-                            .clone()
-                            .unwrap_or_else(|| "marked blocked by agent".into());
-                        crate::goals::engine::AutonomousSessionStatus::Blocked(reason)
-                    } else {
-                        GoalEngine::interpret_autonomous_result(&output)
-                    };
+                    let status = GoalEngine::interpret_autonomous_result(&output);
                     let wm = GoalEngine::extract_working_memory(&output, 2000);
                     state.goals[gi].working_memory = Some(wm);
                     state.goals[gi].total_iterations += iter_cost;
