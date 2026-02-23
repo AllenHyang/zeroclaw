@@ -193,7 +193,7 @@ struct LarkMessage {
 
 /// Heartbeat timeout for WS connection — must be larger than ping_interval (default 120 s).
 /// If no binary frame (pong or event) is received within this window, reconnect.
-const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(300);
+const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Refresh tenant token this many seconds before the announced expiry.
 const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 /// Fallback tenant token TTL when `expire`/`expires_in` is absent.

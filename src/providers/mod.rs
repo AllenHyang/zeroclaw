@@ -2414,6 +2414,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         let provider = create_resilient_provider(
@@ -2453,6 +2454,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         // Primary uses a ZAI key; fallbacks (lmstudio, ollama) should NOT
@@ -2475,6 +2477,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         let provider =
@@ -2501,6 +2504,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -2533,6 +2537,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         let provider = create_resilient_provider("zai", Some("zai-test-key"), None, &reliability);
@@ -2825,6 +2830,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         // openai-codex resolves its own OAuth credential; it should not
@@ -2854,6 +2860,7 @@ mod tests {
             channel_max_backoff_secs: 60,
             scheduler_poll_secs: 15,
             scheduler_retries: 2,
+            max_concurrent_llm_calls: 2,
         };
 
         let provider = create_resilient_provider("ollama", None, None, &reliability);

@@ -6,7 +6,32 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+// ── Global LLM Concurrency Control ──────────────────────────────────────
+// A process-wide semaphore caps concurrent LLM calls across all daemon
+// components (channel, goal-loop, cron, heartbeat) to prevent 429 storms.
+
+static LLM_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+/// Initialise the global LLM concurrency semaphore.  Call once at daemon
+/// startup before spawning any component tasks.  Safe to call multiple times
+/// (only the first call takes effect).
+pub fn init_llm_concurrency(max: usize) {
+    LLM_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max.max(1))));
+}
+
+/// Acquire a permit from the global LLM semaphore.  Returns `None` when the
+/// semaphore has not been initialised (e.g. CLI one-shot mode), in which case
+/// callers proceed without concurrency limiting.
+async fn acquire_llm_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if let Some(sem) = LLM_SEMAPHORE.get() {
+        Arc::clone(sem).acquire_owned().await.ok()
+    } else {
+        None
+    }
+}
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -309,6 +334,7 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        let _llm_permit = acquire_llm_permit().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -433,6 +459,7 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        let _llm_permit = acquire_llm_permit().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -557,6 +584,7 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        let _llm_permit = acquire_llm_permit().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -667,6 +695,7 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        let _llm_permit = acquire_llm_permit().await;
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
