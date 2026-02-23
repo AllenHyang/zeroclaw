@@ -2375,6 +2375,13 @@ pub struct GoalLoopConfig {
     #[serde(default)]
     pub auto_approve_low_priority: bool,
 
+    /// Auto-approve ALL pending goals regardless of priority.
+    /// When enabled, every pending goal with steps is promoted to
+    /// `in_progress` each cycle.  Overrides `auto_approve_low_priority`.
+    /// Default: `false`.
+    #[serde(default)]
+    pub auto_approve_all: bool,
+
     /// Default execution mode for newly promoted goals.
     /// `"autonomous"` (default): agent runs in a long session with intent+criteria.
     /// `"stepped"`: legacy per-step pipeline.
@@ -2424,6 +2431,7 @@ impl Default for GoalLoopConfig {
             explore_cooldown_minutes: default_explore_cooldown_minutes(),
             max_explorations_per_day: default_max_explorations_per_day(),
             auto_approve_low_priority: false,
+            auto_approve_all: false,
             default_execution_mode: default_execution_mode(),
             autonomous_timeout_secs: default_autonomous_timeout_secs(),
             max_total_goal_iterations: default_max_total_goal_iterations(),

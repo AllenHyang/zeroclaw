@@ -151,12 +151,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let job = create_digest_job_with_schedule(
-            &config,
-            "0 22 * * *",
-            Some("Asia/Shanghai".into()),
-        )
-        .unwrap();
+        let job =
+            create_digest_job_with_schedule(&config, "0 22 * * *", Some("Asia/Shanghai".into()))
+                .unwrap();
 
         match &job.schedule {
             Schedule::Cron { expr, tz } => {

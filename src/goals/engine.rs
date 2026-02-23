@@ -635,7 +635,9 @@ impl GoalEngine {
              Goal quality rules:\n\
              \x20  - The goal MUST be completable and verifiable (not \"research X\" or \"learn about Y\")\n\
              \x20  - The goal MUST NOT require user intervention or approval to proceed\n\
-             \x20  - The goal MUST NOT duplicate any existing goal (check the goal list above)\n\
+             \x20  - The goal MUST NOT duplicate any in_progress or completed goal\n\
+             \x20  - Pending goals are stalled and do NOT block you from creating new goals\n\
+             \x20    in different directions\n\
              \x20  - Each step must have a concrete action and expected outcome\n\n\
              If you genuinely found nothing actionable:\n\
              \x20  - Write a brief journal entry using memory_store\n\
@@ -646,7 +648,8 @@ impl GoalEngine {
              - Max 12 tool calls total.\n\
              - Budget: 3 reconnaissance + 6 exploration + 3 output.\n\
              - One deep investigation beats five shallow scans.\n\
-             - Do NOT create duplicate goals.\n\
+             - Do NOT duplicate in_progress or completed goals.\n\
+             - Pending goals do NOT count as duplicates — create new goals freely.\n\
              - Do NOT create goals that need the user to provide information.\n",
         );
 
@@ -686,7 +689,9 @@ impl GoalEngine {
         }
         buf.push('\n');
 
-        buf.push_str("== Pending goals (awaiting approval) ==\n");
+        buf.push_str(
+            "== Pending goals (awaiting approval — NOT being executed) ==\n",
+        );
         let pending: Vec<&Goal> = state
             .goals
             .iter()
@@ -696,8 +701,13 @@ impl GoalEngine {
             buf.push_str("(none)\n");
         } else {
             for g in &pending {
-                let _ = writeln!(buf, "- {}", g.description);
+                let _ = writeln!(buf, "- {} [STALLED: waiting for human approval]", g.description);
             }
+            buf.push_str(
+                "NOTE: Pending goals are NOT running and may never be approved. \
+                 They do NOT count as coverage — you may create goals in \
+                 different directions.\n",
+            );
         }
         buf.push('\n');
     }
