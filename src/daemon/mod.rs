@@ -593,6 +593,10 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
         let explore_cooldown_secs =
             u64::from(config.goal_loop.explore_cooldown_minutes.max(1)) * 60;
 
+        // Channel prefixes for intent/confirmation scan (re-computed each
+        // cycle so hot-reload picks up newly enabled channels).
+        let channel_prefixes = active_channel_prefixes(&config);
+
         crate::goals::status::increment_cycle();
         crate::goals::status::set_intervals(idle_interval.as_secs(), active_interval.as_secs());
         crate::goals::status::set_exploration_config(
@@ -601,7 +605,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
             explore_cooldown_secs,
         );
 
-        let mut state = match engine.load_state().await {
+        let mut state = match engine.load_and_normalize().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Goal loop: failed to load state: {e}");
@@ -846,7 +850,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
 
                     let user_messages: Vec<_> = entries
                         .into_iter()
-                        .filter(|e| e.key.starts_with("feishu_"))
+                        .filter(|e| {
+                            channel_prefixes
+                                .iter()
+                                .any(|p| e.key.starts_with(p.as_str()))
+                        })
                         .collect();
 
                     // Check for approval keywords
@@ -954,7 +962,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     // Only user messages from Feishu, excluding already-scanned
                     let messages: Vec<_> = entries
                         .into_iter()
-                        .filter(|e| e.key.starts_with("feishu_"))
+                        .filter(|e| {
+                            channel_prefixes
+                                .iter()
+                                .any(|p| e.key.starts_with(p.as_str()))
+                        })
                         .filter(|e| {
                             if let Some(ref ts) = last_intent_scan_ts {
                                 e.timestamp.as_str() > ts.as_str()
@@ -1047,7 +1059,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     }
 
                     // Reload state — agent may have created new goals
-                    if let Ok(new_state) = engine.load_state().await {
+                    if let Ok(new_state) = engine.load_and_normalize().await {
                         state = new_state;
                     }
                 }
@@ -1084,6 +1096,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 tracing::info!("Goal loop: no active goals, triggering idle exploration");
                 crate::goals::status::set_mode("exploring");
                 crate::health::set_component_activity("goal-loop", Some("exploring"));
+
+                // GAP 3: Snapshot existing goal IDs before exploration so we
+                // can identify newly created goals and seed their working memory.
+                let pre_exploration_ids: std::collections::HashSet<String> =
+                    state.goals.iter().map(|g| g.id.clone()).collect();
+
                 let prompt = GoalEngine::build_exploration_prompt(&state);
                 let temp = config.default_temperature;
 
@@ -1138,10 +1156,96 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         )
                         .await;
 
+                        // GAP 1: Rust-guaranteed journal fallback.
+                        // If the LLM skipped memory_store, write a fallback entry
+                        // so exploration insights are never lost.
+                        if let Some(ref mem) = mem {
+                            use crate::memory::Memory;
+                            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                            let journal_key = format!(
+                                "exploration-journal-{today_str}-{daily_exploration_count}"
+                            );
+                            let has_journal = match mem.get(&journal_key).await {
+                                Ok(Some(_)) => true,
+                                _ => {
+                                    // Fuzzy check: any journal entry created after started_at
+                                    match mem
+                                        .recall(
+                                            &format!("exploration-journal-{today_str}"),
+                                            1,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(entries) => entries.iter().any(|e| {
+                                            e.timestamp.as_str() >= started_at.to_rfc3339().as_str()
+                                        }),
+                                        Err(_) => false,
+                                    }
+                                }
+                            };
+                            if !has_journal {
+                                let fallback_content = format!(
+                                    "[Rust fallback] {}",
+                                    crate::util::truncate_with_ellipsis(&output, 1500),
+                                );
+                                if let Err(e) = mem
+                                    .store(
+                                        &journal_key,
+                                        &fallback_content,
+                                        crate::memory::MemoryCategory::Custom("exploration".into()),
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to write exploration journal fallback: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        key = %journal_key,
+                                        "Wrote Rust fallback exploration journal entry"
+                                    );
+                                }
+                            }
+                        }
+
                         // Reload state — exploration may have created new goals
-                        if let Ok(new_state) = engine.load_state().await {
+                        if let Ok(new_state) = engine.load_and_normalize().await {
                             state = new_state;
                         }
+
+                        // GAP 3: Seed working memory for exploration-created goals.
+                        // New goals written by the LLM during exploration lack context
+                        // about WHY they were created; seed it from the exploration output.
+                        {
+                            let mut seeded = false;
+                            let today_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                            let truncated_context = crate::util::truncate_with_ellipsis(
+                                &clean_for_display(&output),
+                                800,
+                            );
+                            for goal in &mut state.goals {
+                                if !pre_exploration_ids.contains(&goal.id)
+                                    && goal.working_memory.is_none()
+                                {
+                                    goal.working_memory = Some(format!(
+                                        "Created by idle exploration on {today_str}.\n\n\
+                                         Exploration context:\n{truncated_context}"
+                                    ));
+                                    goal.updated_at = chrono::Utc::now().to_rfc3339();
+                                    seeded = true;
+                                    tracing::info!(
+                                        goal_id = %goal.id,
+                                        "Seeded working memory for exploration-created goal"
+                                    );
+                                }
+                            }
+                            if seeded {
+                                let _ = engine.save_state(&state).await;
+                            }
+                        }
+
                         if has_actionable_goals(&state) {
                             tracing::info!(
                                 "Exploration created actionable goals, executing immediately"
@@ -1226,7 +1330,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         "Goal reflection completed"
                     );
                     // Reload state — the agent may have modified goals.json
-                    state = match engine.load_state().await {
+                    state = match engine.load_and_normalize().await {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::warn!(
@@ -1333,7 +1437,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
             let job_id = format!("__goal_{goal_id}");
 
             // Reload state — the agent may have modified goals.json directly
-            state = match engine.load_state().await {
+            state = match engine.load_and_normalize().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -1729,6 +1833,48 @@ async fn notify_goal_event(config: &Config, title: &str, message: &str) {
     } else {
         tracing::info!("Goal event (no delivery channel): {message}");
     }
+}
+
+/// Return message-key prefixes for all configured conversational channels.
+///
+/// Each channel stores messages with a `{channel_name}_` prefix in the
+/// memory DB.  This function inspects `ChannelsConfig` and returns prefixes
+/// for every `is_some()` channel, excluding non-conversational ones
+/// (webhook, cli).
+fn active_channel_prefixes(config: &Config) -> Vec<String> {
+    let ch = &config.channels_config;
+    let mut prefixes = Vec::new();
+
+    // (field_is_some, prefix)
+    let candidates: &[(bool, &str)] = &[
+        (ch.telegram.is_some(), "telegram_"),
+        (ch.discord.is_some(), "discord_"),
+        (ch.slack.is_some(), "slack_"),
+        (ch.mattermost.is_some(), "mattermost_"),
+        (ch.imessage.is_some(), "imessage_"),
+        (ch.matrix.is_some(), "matrix_"),
+        (ch.signal.is_some(), "signal_"),
+        (ch.whatsapp.is_some(), "whatsapp_"),
+        (ch.linq.is_some(), "linq_"),
+        (ch.nextcloud_talk.is_some(), "nextcloud_talk_"),
+        (ch.email.is_some(), "email_"),
+        (ch.irc.is_some(), "irc_"),
+        (ch.lark.is_some(), "lark_"),
+        (ch.feishu.is_some(), "feishu_"),
+        (ch.dingtalk.is_some(), "dingtalk_"),
+        (ch.qq.is_some(), "qq_"),
+        (ch.nostr.is_some(), "nostr_"),
+        (ch.clawdtalk.is_some(), "clawdtalk_"),
+    ];
+    // webhook excluded (not conversational), cli excluded (bool, not Option)
+
+    for &(enabled, prefix) in candidates {
+        if enabled {
+            prefixes.push(prefix.to_string());
+        }
+    }
+
+    prefixes
 }
 
 fn has_supervised_channels(config: &Config) -> bool {
@@ -2177,5 +2323,77 @@ mod tests {
             }],
         };
         assert!(!has_actionable_goals(&state));
+    }
+
+    // ── active_channel_prefixes tests ──────────────────────────
+
+    #[test]
+    fn channel_prefixes_empty_config() {
+        let config = Config::default();
+        let prefixes = active_channel_prefixes(&config);
+        assert!(
+            prefixes.is_empty(),
+            "default config has no channels enabled"
+        );
+    }
+
+    #[test]
+    fn channel_prefixes_single_channel() {
+        let mut config = Config::default();
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "id".into(),
+            app_secret: "secret".into(),
+            verification_token: None,
+            encrypt_key: None,
+            allowed_users: vec![],
+            receive_mode: crate::config::schema::LarkReceiveMode::default(),
+            port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 10,
+        });
+        let prefixes = active_channel_prefixes(&config);
+        assert_eq!(prefixes, vec!["feishu_"]);
+    }
+
+    #[test]
+    fn channel_prefixes_multiple_channels() {
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "token".into(),
+            allowed_users: vec![],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+        });
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "id".into(),
+            app_secret: "secret".into(),
+            verification_token: None,
+            encrypt_key: None,
+            allowed_users: vec![],
+            receive_mode: crate::config::schema::LarkReceiveMode::default(),
+            port: None,
+            draft_update_interval_ms: 3000,
+            max_draft_edits: 10,
+        });
+        let prefixes = active_channel_prefixes(&config);
+        assert!(prefixes.contains(&"telegram_".to_string()));
+        assert!(prefixes.contains(&"feishu_".to_string()));
+        assert_eq!(prefixes.len(), 2);
+    }
+
+    #[test]
+    fn channel_prefixes_excludes_webhook() {
+        let mut config = Config::default();
+        config.channels_config.webhook = Some(crate::config::schema::WebhookConfig {
+            port: 9090,
+            secret: Some("secret".into()),
+        });
+        let prefixes = active_channel_prefixes(&config);
+        assert!(
+            !prefixes.iter().any(|p| p.starts_with("webhook")),
+            "webhook should be excluded"
+        );
     }
 }

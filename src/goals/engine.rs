@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -228,6 +229,57 @@ impl GoalEngine {
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, &self.state_path).await?;
         Ok(())
+    }
+
+    /// Load, normalize, and re-save goal state.
+    ///
+    /// Handles schema drift caused by LLM writing goals.json directly via
+    /// `file_write` (bypassing `save_state`). Normalizations applied:
+    /// 1. Fill empty `id` with a new UUID.
+    /// 2. Fill empty `created_at` / `updated_at` with current timestamp.
+    /// 3. Deduplicate by `id` (keep last occurrence).
+    /// 4. Re-save through `save_state` (drops unknown fields, fills serde
+    ///    defaults, normalizes enum strings).
+    pub async fn load_and_normalize(&self) -> Result<GoalState> {
+        let mut state = self.load_state().await?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut changed = false;
+
+        for goal in &mut state.goals {
+            if goal.id.is_empty() {
+                goal.id = uuid::Uuid::new_v4().to_string();
+                changed = true;
+            }
+            if goal.created_at.is_empty() {
+                goal.created_at = now.clone();
+                changed = true;
+            }
+            if goal.updated_at.is_empty() {
+                goal.updated_at = now.clone();
+                changed = true;
+            }
+        }
+
+        // Deduplicate by id — keep last occurrence
+        let mut seen = HashSet::new();
+        let original_len = state.goals.len();
+        // Iterate from the back so the *last* occurrence survives
+        state.goals = state
+            .goals
+            .into_iter()
+            .rev()
+            .filter(|g| seen.insert(g.id.clone()))
+            .collect::<Vec<_>>();
+        state.goals.reverse(); // restore original order
+        if state.goals.len() != original_len {
+            changed = true;
+        }
+
+        if changed {
+            self.save_state(&state).await?;
+        }
+
+        Ok(state)
     }
 
     /// Select the next actionable (goal_index, step_index) pair.
@@ -2621,5 +2673,127 @@ max_steps_per_cycle = 3
         };
         let prompt = GoalEngine::build_exploration_prompt(&state);
         assert!(prompt.contains("Awaiting goal [WAITING: confirmation pending]"));
+    }
+
+    // ── load_and_normalize tests ─────────────────────────────────
+
+    #[tokio::test]
+    async fn normalize_fills_empty_id() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Write a goal with empty id directly (simulating LLM file_write)
+        let raw = r#"{"goals":[{"id":"","description":"test","status":"pending","steps":[]}]}"#;
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("goals.json"), raw).unwrap();
+
+        let state = engine.load_and_normalize().await.unwrap();
+        assert_eq!(state.goals.len(), 1);
+        assert!(!state.goals[0].id.is_empty(), "empty id should be filled");
+        // Verify it's a valid UUID
+        assert!(uuid::Uuid::parse_str(&state.goals[0].id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn normalize_fills_empty_timestamps() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        let raw = r#"{"goals":[{"id":"g1","description":"test","status":"pending","created_at":"","updated_at":"","steps":[]}]}"#;
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("goals.json"), raw).unwrap();
+
+        let state = engine.load_and_normalize().await.unwrap();
+        assert!(!state.goals[0].created_at.is_empty());
+        assert!(!state.goals[0].updated_at.is_empty());
+    }
+
+    #[tokio::test]
+    async fn normalize_deduplicates_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        let raw = r#"{"goals":[
+            {"id":"g1","description":"first","status":"pending","steps":[]},
+            {"id":"g2","description":"unique","status":"pending","steps":[]},
+            {"id":"g1","description":"duplicate-last","status":"in_progress","steps":[]}
+        ]}"#;
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("goals.json"), raw).unwrap();
+
+        let state = engine.load_and_normalize().await.unwrap();
+        assert_eq!(state.goals.len(), 2);
+        // g2 (unique) retains its position; g1's last occurrence wins
+        assert_eq!(state.goals[0].id, "g2");
+        assert_eq!(state.goals[0].description, "unique");
+        assert_eq!(state.goals[1].id, "g1");
+        assert_eq!(state.goals[1].description, "duplicate-last");
+    }
+
+    #[tokio::test]
+    async fn normalize_drops_unknown_fields() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Unknown field "llm_junk" should be dropped on re-save
+        let raw = r#"{"goals":[{"id":"g1","description":"test","status":"pending","steps":[],"llm_junk":"should_be_dropped"}]}"#;
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("goals.json"), raw).unwrap();
+
+        let _ = engine.load_and_normalize().await.unwrap();
+
+        // Re-read raw file and verify unknown field is gone
+        let saved = std::fs::read_to_string(state_dir.join("goals.json")).unwrap();
+        assert!(
+            !saved.contains("llm_junk"),
+            "unknown field should be dropped after normalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_heals_invalid_enum() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // "BOGUS_STATUS" should self-heal to "pending" via custom Deserialize
+        let raw =
+            r#"{"goals":[{"id":"g1","description":"test","status":"BOGUS_STATUS","steps":[]}]}"#;
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("goals.json"), raw).unwrap();
+
+        let state = engine.load_and_normalize().await.unwrap();
+        assert_eq!(state.goals[0].status, GoalStatus::Pending);
+
+        // After re-save, status should be canonical "pending"
+        let saved = std::fs::read_to_string(state_dir.join("goals.json")).unwrap();
+        assert!(saved.contains("\"pending\""));
+    }
+
+    #[tokio::test]
+    async fn normalize_noop_on_clean_state() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Save a clean state first
+        let state = sample_goal_state();
+        engine.save_state(&state).await.unwrap();
+
+        // Normalize should not error and should return same data
+        let normalized = engine.load_and_normalize().await.unwrap();
+        assert_eq!(normalized.goals.len(), state.goals.len());
+    }
+
+    #[tokio::test]
+    async fn normalize_empty_state() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        let state = engine.load_and_normalize().await.unwrap();
+        assert!(state.goals.is_empty());
     }
 }
