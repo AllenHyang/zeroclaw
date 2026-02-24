@@ -661,6 +661,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/goals", post(api::handle_api_goals_create))
         .route("/api/goals/{id}", patch(api::handle_api_goals_update))
         .route("/api/dashboard", get(api::handle_api_dashboard))
+        .route("/api/peers", get(api::handle_api_peers))
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──

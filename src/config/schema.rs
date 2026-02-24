@@ -243,6 +243,9 @@ pub struct DelegateAgentConfig {
     /// Maximum tool-call iterations in agentic mode.
     #[serde(default = "default_max_tool_iterations")]
     pub max_iterations: usize,
+    /// Remote workspace name. When set, delegate via HTTP to a peer daemon instead of local provider.
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 fn default_max_depth() -> u32 {
@@ -3680,7 +3683,7 @@ struct ActiveWorkspaceState {
     config_dir: String,
 }
 
-fn default_config_dir() -> Result<PathBuf> {
+pub(crate) fn default_config_dir() -> Result<PathBuf> {
     let home = UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
@@ -3935,7 +3938,7 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-fn decrypt_optional_secret(
+pub(crate) fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
     field_name: &str,
@@ -3952,7 +3955,7 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
-fn decrypt_secret(
+pub(crate) fn decrypt_secret(
     store: &crate::security::SecretStore,
     value: &mut String,
     field_name: &str,
@@ -5240,6 +5243,7 @@ tool_dispatcher = "xml"
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
 

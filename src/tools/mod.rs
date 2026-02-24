@@ -571,6 +571,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
 

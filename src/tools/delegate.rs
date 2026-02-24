@@ -190,12 +190,6 @@ impl Tool for DelegateTool {
             });
         }
 
-        let context = args
-            .get("context")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .unwrap_or("");
-
         // Look up agent config
         let agent_config = match self.agents.get(agent_name) {
             Some(cfg) => cfg,
@@ -245,6 +239,27 @@ impl Tool for DelegateTool {
             });
         }
 
+        // Build the full prompt early — needed for both local and remote paths.
+        let full_prompt = {
+            let context = args
+                .get("context")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if context.is_empty() {
+                prompt.to_string()
+            } else {
+                format!("[Context]\n{context}\n\n[Task]\n{prompt}")
+            }
+        };
+
+        // Remote delegation: forward to a peer daemon via HTTP.
+        if let Some(ref remote_ws) = agent_config.remote {
+            return self
+                .execute_remote(agent_name, remote_ws, &full_prompt)
+                .await;
+        }
+
         // Create provider for this agent
         let provider_credential_owned = agent_config
             .api_key
@@ -270,13 +285,6 @@ impl Tool for DelegateTool {
                     error_kind: None,
                 });
             }
-        };
-
-        // Build the message
-        let full_prompt = if context.is_empty() {
-            prompt.to_string()
-        } else {
-            format!("[Context]\n{context}\n\n[Task]\n{prompt}")
         };
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
@@ -463,6 +471,135 @@ impl DelegateTool {
             }),
         }
     }
+
+    /// Delegate to a peer daemon via HTTP webhook.
+    async fn execute_remote(
+        &self,
+        agent_name: &str,
+        remote_ws: &str,
+        full_prompt: &str,
+    ) -> anyhow::Result<ToolResult> {
+        use crate::workspace::{discover_workspaces, RunStatus};
+
+        let self_config_dir = self
+            .provider_runtime_options
+            .zeroclaw_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve config dir for remote delegation"))?;
+
+        let workspaces = discover_workspaces(Some(self_config_dir))
+            .map_err(|e| anyhow::anyhow!("Failed to discover workspaces: {e}"))?;
+
+        let target = workspaces
+            .iter()
+            .find(|w| w.name == remote_ws)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Remote workspace '{remote_ws}' not found. Available: {}",
+                    workspaces
+                        .iter()
+                        .map(|w| w.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+
+        if !matches!(target.running, RunStatus::Running { .. }) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Remote workspace '{remote_ws}' is not running. Start it with: zeroclaw workspace start {remote_ws}"
+                )),
+                error_kind: None,
+            });
+        }
+
+        // Read peer token for authentication
+        let token_path = self_config_dir
+            .join(".peer_tokens")
+            .join(format!("{remote_ws}.token"));
+        let token = std::fs::read_to_string(&token_path).map_err(|e| {
+            anyhow::anyhow!(
+                "No peer token for '{remote_ws}' at {}: {e}. \
+                 Re-clone or manually exchange tokens.",
+                token_path.display()
+            )
+        })?;
+        let token = token.trim().to_string();
+
+        let url = format!("http://{}:{}/webhook", target.host, target.port);
+
+        let client = crate::config::build_runtime_proxy_client_with_timeouts(
+            "delegate.remote",
+            DELEGATE_TIMEOUT_SECS,
+            10,
+        );
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .json(&serde_json::json!({ "message": full_prompt }))
+                .send(),
+        )
+        .await;
+
+        let resp = match resp {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Remote delegation to '{remote_ws}' failed: {e}"
+                    )),
+                    error_kind: None,
+                });
+            }
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Remote delegation to '{remote_ws}' timed out after {DELEGATE_TIMEOUT_SECS}s"
+                    )),
+                    error_kind: None,
+                });
+            }
+        };
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if status.is_success() {
+            // Try to extract "response" field from JSON, fallback to raw body
+            let output = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(String::from))
+                .unwrap_or(body);
+
+            Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' via remote '{remote_ws}']\n{output}"
+                ),
+                error: None,
+                error_kind: None,
+            })
+        } else {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Remote '{remote_ws}' returned HTTP {status}: {body}"
+                )),
+                error_kind: None,
+            })
+        }
+    }
 }
 
 struct ToolArcRef {
@@ -535,6 +672,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
         agents.insert(
@@ -549,6 +687,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
         agents
@@ -703,6 +842,7 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            remote: None,
         }
     }
 
@@ -811,6 +951,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -917,6 +1058,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -952,6 +1094,7 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                remote: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());

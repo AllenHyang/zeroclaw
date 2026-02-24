@@ -4,6 +4,10 @@ pub mod wizard;
 #[allow(unused_imports)]
 pub use wizard::{run_channels_repair_wizard, run_models_refresh, run_quick_setup, run_wizard};
 
+// Re-exported for workspace clone (crate-internal only)
+#[allow(unused_imports)]
+pub(crate) use wizard::{scaffold_workspace, ProjectContext};
+
 #[cfg(test)]
 mod tests {
     use super::*;

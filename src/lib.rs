@@ -70,6 +70,7 @@ pub(crate) mod skills;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+pub(crate) mod workspace;
 
 pub use config::Config;
 
@@ -158,6 +159,42 @@ pub enum SkillCommands {
     Remove {
         /// Skill name to remove
         name: String,
+    },
+}
+
+/// Workspace management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkspaceCommands {
+    /// Clone current workspace to create a new isolated instance
+    Clone {
+        /// Name for the new workspace (creates ~/.zeroclaw-<name>/)
+        name: String,
+        /// Gateway port (default: auto-assign max+1)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Switch to the new workspace after creation
+        #[arg(long)]
+        switch: bool,
+    },
+    /// List all known workspaces
+    List,
+    /// Switch the active workspace
+    Switch {
+        /// Workspace name (or "default" for ~/.zeroclaw/)
+        name: String,
+    },
+    /// Start daemon for a workspace (or all stopped workspaces if no name given)
+    Start {
+        /// Workspace name (omit to start all stopped workspaces)
+        name: Option<String>,
+    },
+    /// Stop daemon for a workspace
+    Stop {
+        /// Workspace name (omit to stop the active workspace)
+        name: Option<String>,
+        /// Stop all running workspace daemons
+        #[arg(long)]
+        all: bool,
     },
 }
 

@@ -120,7 +120,15 @@ pub async fn handle_api_status(
         channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
     }
 
+    let workspace_name = config
+        .config_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| crate::workspace::workspace_name_from_dir(&n.to_string_lossy()))
+        .unwrap_or_else(|| "unknown".to_string());
+
     let body = serde_json::json!({
+        "workspace": workspace_name,
         "provider": config.default_provider,
         "model": state.model,
         "temperature": state.temperature,
@@ -1026,6 +1034,58 @@ fn mask_sensitive_fields(toml_str: &str) -> String {
         output.push('\n');
     }
     output
+}
+
+// ── Peers ───────────────────────────────────────────────────────
+
+/// GET /api/peers — list discovered peer workspaces.
+pub async fn handle_api_peers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let self_dir = config.config_path.parent().map(std::path::Path::to_path_buf);
+
+    let workspaces = match crate::workspace::discover_workspaces(self_dir.as_deref()) {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to discover workspaces: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let self_name = self_dir
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|n| crate::workspace::workspace_name_from_dir(&n.to_string_lossy()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let peers: Vec<serde_json::Value> = workspaces
+        .iter()
+        .filter(|w| w.name != self_name)
+        .map(|w| {
+            let (running, pid) = match &w.running {
+                crate::workspace::RunStatus::Running { pid } => (true, Some(*pid)),
+                _ => (false, None),
+            };
+            serde_json::json!({
+                "name": w.name,
+                "host": w.host,
+                "port": w.port,
+                "running": running,
+                "pid": pid,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "peers": peers })).into_response()
 }
 
 #[cfg(test)]

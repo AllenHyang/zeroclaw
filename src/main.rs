@@ -83,13 +83,14 @@ mod skills;
 mod tools;
 mod tunnel;
 mod util;
+mod workspace;
 
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
     ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    PeripheralCommands, ServiceCommands, SkillCommands, WorkspaceCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -362,6 +363,24 @@ Examples:
     Migrate {
         #[command(subcommand)]
         migrate_command: MigrateCommands,
+    },
+
+    /// Manage workspaces for multi-daemon deployment
+    #[command(long_about = "\
+Manage workspaces for multi-daemon deployment.
+
+Clone the current workspace to create isolated instances, list all \
+known workspaces, or switch the active workspace.
+
+Examples:
+  zeroclaw workspace list
+  zeroclaw workspace clone agent2 --port 37174
+  zeroclaw workspace clone agent2 --port 37174 --switch
+  zeroclaw workspace switch agent2
+  zeroclaw workspace switch default")]
+    Workspace {
+        #[command(subcommand)]
+        workspace_command: WorkspaceCommands,
     },
 
     /// Manage provider subscription authentication profiles
@@ -980,6 +999,10 @@ async fn main() -> Result<()> {
 
         Commands::Migrate { migrate_command } => {
             migration::handle_command(migrate_command, &config).await
+        }
+
+        Commands::Workspace { workspace_command } => {
+            workspace::handle_command(workspace_command, &config).await
         }
 
         Commands::Memory { memory_command } => {
