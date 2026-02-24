@@ -71,6 +71,14 @@ pub struct Goal {
     /// User feedback when rejecting a confirmation (triggers re-generation).
     #[serde(default)]
     pub confirmation_feedback: Option<String>,
+
+    // ── Notification delivery tracking ──────────────────────────
+    /// Whether the last status-change notification was delivered.
+    #[serde(default)]
+    pub last_notification_delivered: bool,
+    /// Timestamp (RFC 3339) of the last successful delivery.
+    #[serde(default)]
+    pub last_notification_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -147,8 +155,30 @@ pub enum AutonomousSessionStatus {
     Blocked(String),
 }
 
+/// Accept both `"1"` and `1` when deserializing an id field.
+fn deserialize_string_or_int<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct StringOrInt;
+    impl<'de> serde::de::Visitor<'de> for StringOrInt {
+        type Value = String;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or integer")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_owned())
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    d.deserialize_any(StringOrInt)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
+    #[serde(deserialize_with = "deserialize_string_or_int")]
     pub id: String,
     pub description: String,
     #[serde(default)]
@@ -963,6 +993,8 @@ mod tests {
             confirmation_plan: None,
             confirmation_requested_at: None,
             confirmation_feedback: None,
+            last_notification_delivered: false,
+            last_notification_at: None,
         }
     }
 
@@ -999,6 +1031,8 @@ mod tests {
             confirmation_plan: None,
             confirmation_requested_at: None,
             confirmation_feedback: None,
+            last_notification_delivered: false,
+            last_notification_at: None,
         }
     }
 
@@ -2795,5 +2829,54 @@ max_steps_per_cycle = 3
 
         let state = engine.load_and_normalize().await.unwrap();
         assert!(state.goals.is_empty());
+    }
+
+    #[test]
+    fn deserialize_goal_without_notification_fields() {
+        // Old goals.json will not have the notification tracking fields.
+        // Ensure serde(default) lets them deserialize without error.
+        let json = r#"{
+            "id": "g-old",
+            "description": "Legacy goal",
+            "status": "in_progress",
+            "priority": "medium",
+            "created_at": "",
+            "updated_at": "",
+            "steps": [],
+            "context": ""
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert!(!goal.last_notification_delivered);
+        assert!(goal.last_notification_at.is_none());
+    }
+
+    #[test]
+    fn step_id_accepts_integer() {
+        let json = r#"{"id": 42, "description": "test step", "status": "pending"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.id, "42");
+    }
+
+    #[test]
+    fn notification_fields_roundtrip() {
+        let mut goal = make_goal(
+            "g-rt",
+            "Roundtrip test",
+            GoalStatus::InProgress,
+            GoalPriority::Medium,
+            vec![],
+            "",
+            None,
+        );
+        goal.last_notification_delivered = true;
+        goal.last_notification_at = Some("2026-02-24T12:00:00Z".into());
+
+        let json = serde_json::to_string(&goal).unwrap();
+        let restored: Goal = serde_json::from_str(&json).unwrap();
+        assert!(restored.last_notification_delivered);
+        assert_eq!(
+            restored.last_notification_at.as_deref(),
+            Some("2026-02-24T12:00:00Z"),
+        );
     }
 }

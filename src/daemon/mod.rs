@@ -730,7 +730,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         crate::health::mark_component_ok("goal-loop");
 
                         // Notify user via channel
-                        notify_goal_event(
+                        let delivered = notify_goal_event(
                             &config,
                             "🦀 ZeroClaw 理解确认",
                             &format!(
@@ -743,6 +743,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             ),
                         )
                         .await;
+                        state.goals[gi].last_notification_delivered = delivered;
+                        if delivered {
+                            state.goals[gi].last_notification_at =
+                                Some(chrono::Utc::now().to_rfc3339());
+                        }
+                        let _ = engine.save_state(&state).await;
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -799,7 +805,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         goal_id = %state.goals[gi].id,
                         "Confirmation timed out — auto-approving"
                     );
-                    notify_goal_event(
+                    let delivered = notify_goal_event(
                         &config,
                         "🦀 ZeroClaw 确认超时",
                         &format!(
@@ -808,6 +814,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         ),
                     )
                     .await;
+                    state.goals[gi].last_notification_delivered = delivered;
+                    if delivered {
+                        state.goals[gi].last_notification_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                    }
                 } else {
                     state.goals[gi].status = GoalStatus::Blocked;
                     state.goals[gi].last_error =
@@ -817,7 +828,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         goal_id = %state.goals[gi].id,
                         "Confirmation timed out — blocking"
                     );
-                    notify_goal_event(
+                    let delivered = notify_goal_event(
                         &config,
                         "🦀 ZeroClaw 确认超时",
                         &format!(
@@ -826,6 +837,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         ),
                     )
                     .await;
+                    state.goals[gi].last_notification_delivered = delivered;
+                    if delivered {
+                        state.goals[gi].last_notification_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                    }
                 }
             }
 
@@ -890,7 +906,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                         goal_id = %state.goals[gi].id,
                                         "User approved confirmation via channel"
                                     );
-                                    notify_goal_event(
+                                    let delivered = notify_goal_event(
                                         &config,
                                         "🦀 ZeroClaw 确认通过",
                                         &format!(
@@ -899,6 +915,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                         ),
                                     )
                                     .await;
+                                    state.goals[gi].last_notification_delivered = delivered;
+                                    if delivered {
+                                        state.goals[gi].last_notification_at =
+                                            Some(chrono::Utc::now().to_rfc3339());
+                                    }
+                                    let _ = engine.save_state(&state).await;
                                 }
                             } else if !content.is_empty() && content.len() > 3 {
                                 // Treat as feedback — reject and request re-generation
@@ -913,7 +935,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                         goal_id = %state.goals[gi].id,
                                         "User rejected confirmation with feedback via channel"
                                     );
-                                    notify_goal_event(
+                                    let delivered = notify_goal_event(
                                         &config,
                                         "🦀 ZeroClaw 确认已拒绝",
                                         &format!(
@@ -922,6 +944,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                         ),
                                     )
                                     .await;
+                                    state.goals[gi].last_notification_delivered = delivered;
+                                    if delivered {
+                                        state.goals[gi].last_notification_at =
+                                            Some(chrono::Utc::now().to_rfc3339());
+                                    }
+                                    let _ = engine.save_state(&state).await;
                                 }
                             }
                         }
@@ -1339,7 +1367,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             break;
                         }
                     };
-                    notify_goal_event(
+                    let delivered = notify_goal_event(
                         &config,
                         "🦀 ZeroClaw 目标反思",
                         &format!(
@@ -1353,6 +1381,13 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         ),
                     )
                     .await;
+                    if let Some(g) = state.goals.get_mut(gi) {
+                        g.last_notification_delivered = delivered;
+                        if delivered {
+                            g.last_notification_at = Some(chrono::Utc::now().to_rfc3339());
+                        }
+                        let _ = engine.save_state(&state).await;
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Goal reflection failed: {e}");
@@ -1381,7 +1416,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                 ));
                 state.goals[gi].updated_at = chrono::Utc::now().to_rfc3339();
                 let _ = engine.save_state(&state).await;
-                notify_goal_event(
+                let delivered = notify_goal_event(
                     &config,
                     "🦀 ZeroClaw 目标暂停",
                     &format!(
@@ -1390,6 +1425,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     ),
                 )
                 .await;
+                state.goals[gi].last_notification_delivered = delivered;
+                if delivered {
+                    state.goals[gi].last_notification_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+                let _ = engine.save_state(&state).await;
                 break;
             }
 
@@ -1507,13 +1547,19 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         }
                     }
                     let msg = format_goal_completed_message(&state.goals[gi]);
-                    notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                    let delivered = notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                    state.goals[gi].last_notification_delivered = delivered;
+                    if delivered {
+                        state.goals[gi].last_notification_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    let _ = engine.save_state(&state).await;
                 } else {
                     let reason = state.goals[gi]
                         .last_error
                         .as_deref()
                         .unwrap_or("agent 标记为受阻");
-                    notify_goal_event(
+                    let delivered = notify_goal_event(
                         &config,
                         "🦀 ZeroClaw 目标受阻",
                         &format!(
@@ -1523,6 +1569,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                         ),
                     )
                     .await;
+                    state.goals[gi].last_notification_delivered = delivered;
+                    if delivered {
+                        state.goals[gi].last_notification_at =
+                            Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    let _ = engine.save_state(&state).await;
                 }
                 // Goal is done, move on to next goal
                 autonomous_executed += 1;
@@ -1573,7 +1625,14 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                 }
                             }
                             let msg = format_goal_completed_message(&state.goals[gi]);
-                            notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                            let delivered =
+                                notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                            state.goals[gi].last_notification_delivered = delivered;
+                            if delivered {
+                                state.goals[gi].last_notification_at =
+                                    Some(chrono::Utc::now().to_rfc3339());
+                            }
+                            let _ = engine.save_state(&state).await;
                         }
                         crate::goals::engine::AutonomousSessionStatus::InProgress => {
                             state.goals[gi].last_error = None;
@@ -1588,7 +1647,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                             state.goals[gi].status = GoalStatus::Blocked;
                             state.goals[gi].last_error = Some(reason.clone());
                             let _ = engine.save_state(&state).await;
-                            notify_goal_event(
+                            let delivered = notify_goal_event(
                                 &config,
                                 "🦀 ZeroClaw 目标受阻",
                                 &format!(
@@ -1598,6 +1657,12 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                 ),
                             )
                             .await;
+                            state.goals[gi].last_notification_delivered = delivered;
+                            if delivered {
+                                state.goals[gi].last_notification_at =
+                                    Some(chrono::Utc::now().to_rfc3339());
+                            }
+                            let _ = engine.save_state(&state).await;
                         }
                     }
                 }
@@ -1712,7 +1777,7 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                 state.goals[gi].steps[si].description,
                                 state.goals[gi].steps[si].attempts,
                             ));
-                            notify_goal_event(
+                            let delivered = notify_goal_event(
                                 &config,
                                 "🦀 ZeroClaw 目标受阻",
                                 &format!(
@@ -1723,6 +1788,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                                 ),
                             )
                             .await;
+                            state.goals[gi].last_notification_delivered = delivered;
+                            if delivered {
+                                state.goals[gi].last_notification_at =
+                                    Some(chrono::Utc::now().to_rfc3339());
+                            }
                             let _ = engine.save_state(&state).await;
                             break;
                         }
@@ -1781,7 +1851,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     }
                 }
                 let msg = format_goal_completed_message(&state.goals[gi]);
-                notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                let delivered = notify_goal_event(&config, "🦀 ZeroClaw 目标完成", &msg).await;
+                state.goals[gi].last_notification_delivered = delivered;
+                if delivered {
+                    state.goals[gi].last_notification_at = Some(chrono::Utc::now().to_rfc3339());
+                }
                 let _ = engine.save_state(&state).await;
                 break;
             }
@@ -1824,15 +1898,44 @@ fn clean_for_display(text: &str) -> String {
     collapse.replace_all(&cleaned, "\n\n").trim().to_string()
 }
 
-/// Send a goal event notification via the configured channel (best-effort).
-async fn notify_goal_event(config: &Config, title: &str, message: &str) {
-    if let (Some(ch_name), Some(target)) = (&config.goal_loop.channel, &config.goal_loop.target) {
-        if let Err(e) = deliver_notification(config, ch_name, target, title, message).await {
-            tracing::warn!("Goal event delivery to {ch_name} failed: {e}");
-        }
-    } else {
+/// Send a goal event notification via the configured channel with retry.
+///
+/// Returns `true` if the notification was successfully delivered, `false` otherwise.
+/// Retries up to 3 attempts with exponential backoff (1s, 2s) before giving up.
+async fn notify_goal_event(config: &Config, title: &str, message: &str) -> bool {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF_BASE_MS: u64 = 1_000;
+
+    let (Some(ch_name), Some(target)) = (&config.goal_loop.channel, &config.goal_loop.target)
+    else {
         tracing::info!("Goal event (no delivery channel): {message}");
+        return false;
+    };
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match deliver_notification(config, ch_name, target, title, message).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!("Goal event delivered on attempt {}", attempt + 1);
+                }
+                return true;
+            }
+            Err(e) => {
+                if attempt + 1 < MAX_ATTEMPTS {
+                    let delay_ms = BACKOFF_BASE_MS * (1 << attempt);
+                    tracing::warn!(
+                        "Goal event delivery failed (attempt {}/{}), retrying in {delay_ms}ms: {e}",
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                } else {
+                    tracing::warn!("Goal event delivery failed after {MAX_ATTEMPTS} attempts: {e}");
+                }
+            }
+        }
     }
+    false
 }
 
 /// Return message-key prefixes for all configured conversational channels.
@@ -2229,6 +2332,8 @@ mod tests {
             confirmation_plan: None,
             confirmation_requested_at: None,
             confirmation_feedback: None,
+            last_notification_delivered: false,
+            last_notification_at: None,
         };
         let msg = format_goal_completed_message(&goal);
         assert!(msg.contains("目标已完成: 测试目标"));
@@ -2255,6 +2360,8 @@ mod tests {
             confirmation_plan: None,
             confirmation_requested_at: None,
             confirmation_feedback: None,
+            last_notification_delivered: false,
+            last_notification_at: None,
         };
         let msg = format_goal_completed_message(&goal);
         assert!(msg.contains("目标已完成: 测试"));
@@ -2293,6 +2400,8 @@ mod tests {
                 confirmation_plan: None,
                 confirmation_requested_at: None,
                 confirmation_feedback: None,
+                last_notification_delivered: false,
+                last_notification_at: None,
             }],
         };
         assert!(has_actionable_goals(&state));
@@ -2320,6 +2429,8 @@ mod tests {
                 confirmation_plan: None,
                 confirmation_requested_at: None,
                 confirmation_feedback: None,
+                last_notification_delivered: false,
+                last_notification_at: None,
             }],
         };
         assert!(!has_actionable_goals(&state));
