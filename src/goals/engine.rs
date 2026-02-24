@@ -305,6 +305,41 @@ impl GoalEngine {
             changed = true;
         }
 
+        // ── Hallucination repair ────────────────────────────────────
+        // LLM agents can write inconsistent data to goals.json.
+        // Fix contradictions so the goal loop operates on clean state.
+        for goal in &mut state.goals {
+            // A goal that was never executed cannot be blocked.
+            if goal.status == GoalStatus::Blocked && goal.total_iterations == 0 {
+                let has_real_attempts = goal.steps.iter().any(|s| s.attempts > 0);
+                if !has_real_attempts {
+                    tracing::info!(
+                        goal_id = %goal.id,
+                        "Normalize: resetting hallucinated blocked → pending (0 iterations, 0 attempts)"
+                    );
+                    goal.status = GoalStatus::Pending;
+                    goal.last_error = None;
+                    changed = true;
+                }
+            }
+
+            // Steps with 0 attempts cannot have results — clear fabricated ones.
+            // Skip completed/cancelled goals: their step results are historical records.
+            if goal.status != GoalStatus::Completed && goal.status != GoalStatus::Cancelled {
+                for step in &mut goal.steps {
+                    if step.attempts == 0 && step.result.is_some() {
+                        tracing::info!(
+                            goal_id = %goal.id,
+                            step_id = %step.id,
+                            "Normalize: clearing hallucinated step result (0 attempts)"
+                        );
+                        step.result = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         if changed {
             self.save_state(&state).await?;
         }
@@ -2877,6 +2912,139 @@ max_steps_per_cycle = 3
         assert_eq!(
             restored.last_notification_at.as_deref(),
             Some("2026-02-24T12:00:00Z"),
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_resets_hallucinated_blocked_goal() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Simulate LLM writing a blocked goal with 0 iterations and 0 attempts
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g-hallucinated",
+                "Build a calculator",
+                GoalStatus::Blocked,
+                GoalPriority::High,
+                vec![Step {
+                    id: "1".into(),
+                    description: "Use coding-agent".into(),
+                    status: StepStatus::Pending,
+                    result: Some("Codex API exhausted".into()), // hallucinated
+                    attempts: 0,
+                }],
+                "fabricated context",
+                Some("fabricated error".into()),
+            )],
+        };
+        engine.save_state(&state).await.unwrap();
+
+        let normalized = engine.load_and_normalize().await.unwrap();
+        let g = &normalized.goals[0];
+        assert_eq!(g.status, GoalStatus::Pending, "should reset to pending");
+        assert!(g.last_error.is_none(), "should clear hallucinated error");
+        assert!(
+            g.steps[0].result.is_none(),
+            "should clear hallucinated step result"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_keeps_legitimately_blocked_goal() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Goal that was actually executed and blocked
+        let state = GoalState {
+            goals: vec![{
+                let g = make_autonomous_goal(
+                    "g-real-blocked",
+                    "Real goal",
+                    GoalStatus::Blocked,
+                    GoalPriority::High,
+                    vec![],
+                    "",
+                    Some("real error after execution".into()),
+                    None,
+                    None,
+                    None,
+                    50, // total_iterations > 0
+                );
+                g
+            }],
+        };
+        engine.save_state(&state).await.unwrap();
+
+        let normalized = engine.load_and_normalize().await.unwrap();
+        let g = &normalized.goals[0];
+        assert_eq!(g.status, GoalStatus::Blocked, "should stay blocked");
+        assert!(g.last_error.is_some(), "should keep real error");
+    }
+
+    #[tokio::test]
+    async fn normalize_keeps_blocked_goal_with_real_step_attempts() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Stepped goal that actually attempted steps
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g-step-blocked",
+                "Stepped goal",
+                GoalStatus::Blocked,
+                GoalPriority::High,
+                vec![Step {
+                    id: "1".into(),
+                    description: "Failed step".into(),
+                    status: StepStatus::Pending,
+                    result: Some("actual failure output".into()),
+                    attempts: 3, // real attempts
+                }],
+                "",
+                Some("Step failed 3 times".into()),
+            )],
+        };
+        engine.save_state(&state).await.unwrap();
+
+        let normalized = engine.load_and_normalize().await.unwrap();
+        let g = &normalized.goals[0];
+        assert_eq!(g.status, GoalStatus::Blocked, "should stay blocked");
+        assert!(g.steps[0].result.is_some(), "should keep real result");
+    }
+
+    #[tokio::test]
+    async fn normalize_preserves_completed_goal_step_results() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Completed goal with step results but 0 attempts (LLM-managed steps)
+        let state = GoalState {
+            goals: vec![make_goal(
+                "g-done",
+                "Completed goal",
+                GoalStatus::Completed,
+                GoalPriority::Medium,
+                vec![Step {
+                    id: "1".into(),
+                    description: "Search stuff".into(),
+                    status: StepStatus::Completed,
+                    result: Some("Found useful data".into()),
+                    attempts: 0, // LLM never incremented attempts
+                }],
+                "",
+                None,
+            )],
+        };
+        engine.save_state(&state).await.unwrap();
+
+        let normalized = engine.load_and_normalize().await.unwrap();
+        let g = &normalized.goals[0];
+        assert_eq!(g.status, GoalStatus::Completed);
+        assert_eq!(
+            g.steps[0].result.as_deref(),
+            Some("Found useful data"),
+            "should preserve completed goal step results"
         );
     }
 }
