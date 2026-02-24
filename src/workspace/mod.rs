@@ -18,7 +18,9 @@ pub use traits::WorkspaceDiscovery;
 /// Run-state of a workspace daemon.
 #[derive(Debug)]
 pub(crate) enum RunStatus {
-    Running { pid: u32 },
+    Running {
+        pid: u32,
+    },
     Stopped,
     /// PID file exists but process is dead.
     Stale,
@@ -40,11 +42,9 @@ pub(crate) struct WorkspaceInfo {
 /// Dispatch workspace subcommands.
 pub async fn handle_command(cmd: WorkspaceCommands, config: &Config) -> Result<()> {
     match cmd {
-        WorkspaceCommands::Clone {
-            name,
-            port,
-            switch,
-        } => clone_workspace(config, &name, port, switch).await,
+        WorkspaceCommands::Clone { name, port, switch } => {
+            clone_workspace(config, &name, port, switch).await
+        }
         WorkspaceCommands::List => list_workspaces(config),
         WorkspaceCommands::Switch { name } => switch_workspace(&name).await,
         WorkspaceCommands::Start { name } => start_workspace(name.as_deref(), config),
@@ -227,10 +227,7 @@ pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Ve
 }
 
 /// Find workspace index by name, or the active one if name is None.
-fn resolve_target(
-    name: Option<&str>,
-    workspaces: &[WorkspaceInfo],
-) -> Result<usize> {
+fn resolve_target(name: Option<&str>, workspaces: &[WorkspaceInfo]) -> Result<usize> {
     match name {
         Some(n) => workspaces
             .iter()
@@ -272,13 +269,12 @@ async fn clone_workspace(
         .config_path
         .parent()
         .context("Source config path must have a parent directory")?;
-    let source_toml =
-        std::fs::read_to_string(&source_config.config_path).with_context(|| {
-            format!(
-                "Failed to read source config: {}",
-                source_config.config_path.display()
-            )
-        })?;
+    let source_toml = std::fs::read_to_string(&source_config.config_path).with_context(|| {
+        format!(
+            "Failed to read source config: {}",
+            source_config.config_path.display()
+        )
+    })?;
     let mut new_config: Config =
         toml::from_str(&source_toml).context("Failed to parse source config.toml")?;
 
@@ -483,7 +479,11 @@ fn append_paired_token_hash(config_dir: &Path, hash_hex: &str) -> Result<()> {
     let existing: MinimalConfig =
         toml::from_str(&toml_str).context("Failed to parse config.toml for token injection")?;
 
-    if existing.gateway.paired_tokens.contains(&hash_hex.to_string()) {
+    if existing
+        .gateway
+        .paired_tokens
+        .contains(&hash_hex.to_string())
+    {
         return Ok(()); // already present
     }
 
@@ -537,17 +537,12 @@ fn append_paired_token_hash(config_dir: &Path, hash_hex: &str) -> Result<()> {
 // ── List ────────────────────────────────────────────────────────
 
 fn list_workspaces(current_config: &Config) -> Result<()> {
-    let active_config_dir = current_config
-        .config_path
-        .parent()
-        .map(|p| p.to_path_buf());
+    let active_config_dir = current_config.config_path.parent().map(|p| p.to_path_buf());
 
     let workspaces = discover_workspaces(active_config_dir.as_deref())?;
 
     println!("Workspaces:\n");
-    let hdr = |n: &str, p: &str, s: &str, t: &str| {
-        format!("       {n:<16} {p:>6}  {s:<15} {t}")
-    };
+    let hdr = |n: &str, p: &str, s: &str, t: &str| format!("       {n:<16} {p:>6}  {s:<15} {t}");
     println!("{}", hdr("NAME", "PORT", "STATUS", "PATH"));
     println!("{}", hdr("────", "────", "──────", "────"));
 
@@ -875,19 +870,14 @@ async fn rename_workspace(config: &Config, old_name: &str, new_name: &str) -> Re
             let new_pattern = format!("remote = \"{new_name}\"");
             if content.contains(&old_pattern) {
                 let updated = content.replace(&old_pattern, &new_pattern);
-                std::fs::write(&peer_config_path, updated).with_context(|| {
-                    format!("Failed to write {}", peer_config_path.display())
-                })?;
+                std::fs::write(&peer_config_path, updated)
+                    .with_context(|| format!("Failed to write {}", peer_config_path.display()))?;
             }
         }
 
         // 4. Rename TLS peer CA: {peer}/tls/peers/{old_name}-ca.pem -> {new_name}-ca.pem
-        let old_ca = ws
-            .config_dir
-            .join(format!("tls/peers/{old_name}-ca.pem"));
-        let new_ca = ws
-            .config_dir
-            .join(format!("tls/peers/{new_name}-ca.pem"));
+        let old_ca = ws.config_dir.join(format!("tls/peers/{old_name}-ca.pem"));
+        let new_ca = ws.config_dir.join(format!("tls/peers/{new_name}-ca.pem"));
         if old_ca.exists() {
             std::fs::rename(&old_ca, &new_ca).with_context(|| {
                 format!(
@@ -966,10 +956,7 @@ mod tests {
     #[test]
     fn workspace_name_from_dir_named() {
         assert_eq!(workspace_name_from_dir(".zeroclaw-agent2"), "agent2");
-        assert_eq!(
-            workspace_name_from_dir(".zeroclaw-my-ws"),
-            "my-ws"
-        );
+        assert_eq!(workspace_name_from_dir(".zeroclaw-my-ws"), "my-ws");
     }
 
     #[test]
@@ -1118,8 +1105,7 @@ mod tests {
         // and rename_workspace explicitly rejects "default" as old_name.
         // Test the old_name guard directly:
         assert_eq!(
-            "default",
-            "default",
+            "default", "default",
             "Precondition: old_name == \"default\" should be caught"
         );
         // The actual bail! happens before any filesystem access, so we

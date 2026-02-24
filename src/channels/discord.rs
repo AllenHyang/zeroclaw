@@ -370,7 +370,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
-            return (value % upper) as usize;
+            return usize::try_from(value % upper).unwrap_or(0);
         }
     }
 }

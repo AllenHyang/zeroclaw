@@ -543,10 +543,7 @@ impl DelegateTool {
         })?;
         let token = token.trim().to_string();
 
-        let is_loopback = matches!(
-            target.host.as_str(),
-            "127.0.0.1" | "localhost" | "::1"
-        );
+        let is_loopback = matches!(target.host.as_str(), "127.0.0.1" | "localhost" | "::1");
 
         // Read TLS config from the target workspace to decide scheme.
         let target_tls_cert = std::fs::read_to_string(target.config_dir.join("config.toml"))
@@ -575,11 +572,7 @@ impl DelegateTool {
             );
         }
 
-        let client = build_peer_client(
-            self_config_dir,
-            remote_ws,
-            DELEGATE_TIMEOUT_SECS,
-        );
+        let client = build_peer_client(self_config_dir, remote_ws, DELEGATE_TIMEOUT_SECS);
 
         let resp = match client
             .post(&url)
