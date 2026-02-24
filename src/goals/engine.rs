@@ -25,34 +25,36 @@ pub struct GoalState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Goal {
+    #[serde(deserialize_with = "deserialize_lenient_string")]
     pub id: String,
+    #[serde(deserialize_with = "deserialize_lenient_string")]
     pub description: String,
     #[serde(default)]
     pub status: GoalStatus,
     #[serde(default)]
     pub priority: GoalPriority,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub created_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub updated_at: String,
     #[serde(default)]
     pub steps: Vec<Step>,
     /// Accumulated context from previous step results.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub context: String,
     /// Last error encountered during step execution.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub last_error: Option<String>,
 
     // ── Autonomous session fields ───────────────────────────────
     /// Success criteria for autonomous mode (what "done" looks like).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub success_criteria: Option<String>,
     /// Constraints the agent must respect during autonomous execution.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub constraints: Option<String>,
     /// Persisted working memory from the last autonomous session.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub working_memory: Option<String>,
     /// Execution mode: `autonomous` (default) or `stepped`.
     #[serde(default)]
@@ -63,13 +65,13 @@ pub struct Goal {
 
     // ── Step-0 confirmation fields ──────────────────────────────
     /// Agent-generated understanding + execution plan (set during AwaitingConfirmation).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub confirmation_plan: Option<String>,
     /// Timestamp (RFC 3339) when the confirmation was requested.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub confirmation_requested_at: Option<String>,
     /// User feedback when rejecting a confirmation (triggers re-generation).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub confirmation_feedback: Option<String>,
 
     // ── Notification delivery tracking ──────────────────────────
@@ -77,7 +79,7 @@ pub struct Goal {
     #[serde(default)]
     pub last_notification_delivered: bool,
     /// Timestamp (RFC 3339) of the last successful delivery.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub last_notification_at: Option<String>,
 }
 
@@ -155,16 +157,24 @@ pub enum AutonomousSessionStatus {
     Blocked(String),
 }
 
-/// Accept both `"1"` and `1` when deserializing an id field.
-fn deserialize_string_or_int<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    struct StringOrInt;
-    impl<'de> serde::de::Visitor<'de> for StringOrInt {
+/// Coerce any JSON value into a `String`.
+///
+/// LLM-generated goals.json may contain unexpected types for string fields:
+/// integers (`1`), booleans (`true`), nulls, or arrays (`["a","b"]`).
+/// This visitor converts all of them to a string representation so that
+/// deserialization never fails on type mismatch.
+fn deserialize_lenient_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct LenientString;
+    impl<'de> serde::de::Visitor<'de> for LenientString {
         type Value = String;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a string or integer")
+            f.write_str("any JSON value coercible to string")
         }
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
             Ok(v.to_owned())
+        }
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<String, E> {
+            Ok(v.to_string())
         }
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<String, E> {
             Ok(v.to_string())
@@ -172,18 +182,43 @@ fn deserialize_string_or_int<'de, D: serde::Deserializer<'de>>(d: D) -> Result<S
         fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<String, E> {
             Ok(v.to_string())
         }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<String, E> {
+            Ok(String::new())
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<String, A::Error> {
+            let mut parts = Vec::new();
+            while let Some(val) = seq.next_element::<serde_json::Value>()? {
+                match val {
+                    serde_json::Value::String(s) => parts.push(s),
+                    other => parts.push(other.to_string()),
+                }
+            }
+            Ok(parts.join(", "))
+        }
     }
-    d.deserialize_any(StringOrInt)
+    d.deserialize_any(LenientString)
+}
+
+/// Coerce any JSON value (including null) into `Option<String>`.
+fn deserialize_lenient_opt_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    let s = deserialize_lenient_string(d)?;
+    Ok(if s.is_empty() { None } else { Some(s) })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
-    #[serde(deserialize_with = "deserialize_string_or_int")]
+    #[serde(deserialize_with = "deserialize_lenient_string")]
     pub id: String,
+    #[serde(deserialize_with = "deserialize_lenient_string")]
     pub description: String,
     #[serde(default)]
     pub status: StepStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_opt_string")]
     pub result: Option<String>,
     #[serde(default)]
     pub attempts: u32,
@@ -2890,6 +2925,62 @@ max_steps_per_cycle = 3
         let json = r#"{"id": 42, "description": "test step", "status": "pending"}"#;
         let step: Step = serde_json::from_str(json).unwrap();
         assert_eq!(step.id, "42");
+    }
+
+    #[test]
+    fn step_id_accepts_array() {
+        let json = r#"{"id": ["a", "b"], "description": "test step"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.id, "a, b");
+    }
+
+    #[test]
+    fn step_id_accepts_bool() {
+        let json = r#"{"id": true, "description": "test step"}"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.id, "true");
+    }
+
+    #[test]
+    fn goal_string_fields_accept_arrays() {
+        // LLM sometimes writes arrays for string fields
+        let json = r#"{
+            "id": "g1",
+            "description": ["do thing A", "then thing B"],
+            "status": "pending",
+            "steps": []
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert_eq!(goal.description, "do thing A, then thing B");
+    }
+
+    #[test]
+    fn goal_opt_string_null_stays_none() {
+        let json = r#"{
+            "id": "g1",
+            "description": "test",
+            "success_criteria": null,
+            "constraints": null,
+            "steps": []
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert!(goal.success_criteria.is_none());
+        assert!(goal.constraints.is_none());
+    }
+
+    #[test]
+    fn goal_opt_string_accepts_array() {
+        let json = r#"{
+            "id": "g1",
+            "description": "test",
+            "success_criteria": ["all tests pass", "no regressions"],
+            "steps": []
+        }"#;
+        let goal: Goal = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            goal.success_criteria.as_deref(),
+            Some("all tests pass, no regressions")
+        );
     }
 
     #[test]

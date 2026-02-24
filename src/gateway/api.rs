@@ -734,6 +734,11 @@ pub async fn handle_api_goals_create(
             .map(parse_execution_mode)
             .unwrap_or_default(),
         total_iterations: 0,
+        confirmation_plan: None,
+        confirmation_requested_at: None,
+        confirmation_feedback: None,
+        last_notification_delivered: false,
+        last_notification_at: None,
     };
 
     goal_state.goals.push(goal.clone());
@@ -1108,6 +1113,11 @@ mod tests {
             working_memory: None,
             execution_mode: crate::goals::engine::GoalExecutionMode::Autonomous,
             total_iterations: 0,
+            confirmation_plan: None,
+            confirmation_requested_at: None,
+            confirmation_feedback: None,
+            last_notification_delivered: false,
+            last_notification_at: None,
         }
     }
 
