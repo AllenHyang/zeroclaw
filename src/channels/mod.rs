@@ -149,6 +149,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    NewConversation,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -509,10 +510,6 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
-    }
-
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -527,7 +524,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
+        // /new and /clear work on all channels.
+        "/new" | "/clear" => Some(ChannelRuntimeCommand::NewConversation),
+        // Model switching is only available on channels that support it.
+        "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -536,7 +536,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" => {
+        "/model" if supports_runtime_model_switch(channel_name) => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -1035,6 +1035,10 @@ async fn handle_runtime_command_if_needed(
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
+        ChannelRuntimeCommand::NewConversation => {
+            clear_sender_history(ctx, &sender_key);
+            "🔄 Conversation context cleared. Starting fresh.".to_string()
+        }
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => {
             match resolve_provider_alias(&raw_provider) {
