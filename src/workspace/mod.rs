@@ -105,6 +105,34 @@ pub(crate) fn read_pid_file(config_dir: &Path) -> Option<u32> {
         .filter(|&pid| pid > 0)
 }
 
+/// Check whether the daemon's flock on `daemon.pid` is currently held.
+/// Returns `true` if the lock is held (daemon is running), `false` otherwise.
+#[cfg(unix)]
+fn is_daemon_lock_held(config_dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let pid_path = config_dir.join("daemon.pid");
+    let file = match std::fs::OpenOptions::new().read(true).open(&pid_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let fd = file.as_raw_fd();
+    // Try to acquire a non-blocking exclusive lock
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        // Successfully acquired = daemon is not holding the lock
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        false
+    } else {
+        // Failed to acquire = daemon holds the lock
+        true
+    }
+}
+
+#[cfg(not(unix))]
+fn is_daemon_lock_held(_config_dir: &Path) -> bool {
+    false
+}
+
 /// Scan all `.zeroclaw*` directories under home and return workspace metadata.
 pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Vec<WorkspaceInfo>> {
     let default_dir = default_config_dir()?;
@@ -119,10 +147,11 @@ pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Ve
         let entry = entry?;
         let dir_name = entry.file_name();
         let dir_name_str = dir_name.to_string_lossy().to_string();
-        if !dir_name_str.starts_with(".zeroclaw") {
+        // Match exactly `.zeroclaw` or `.zeroclaw-{name}` (not `.zeroclaw-backup` etc.)
+        if dir_name_str != ".zeroclaw" && !dir_name_str.starts_with(".zeroclaw-") {
             continue;
         }
-        // Skip unrelated dirs like .zeroclaw-backup or dirs without config
+        // Must contain a config.toml to be a valid workspace
         let dir_path = entry.path();
         let config_path = dir_path.join("config.toml");
         if !config_path.exists() {
@@ -141,7 +170,9 @@ pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Ve
         let is_active = active_config_dir.is_some_and(|active| active == dir_path);
 
         let running = match read_pid_file(&dir_path) {
-            Some(pid) if is_pid_alive(pid) => RunStatus::Running { pid },
+            Some(pid) if is_daemon_lock_held(&dir_path) && is_pid_alive(pid) => {
+                RunStatus::Running { pid }
+            }
             Some(_) => RunStatus::Stale,
             None => RunStatus::Stopped,
         };
@@ -344,8 +375,13 @@ fn auto_assign_port(home: &Path) -> Result<u16> {
 
 // ── Peer token exchange ─────────────────────────────────────────
 
-/// Generate a shared token, hash it into both configs' `paired_tokens`,
-/// and save the plaintext into `.peer_tokens/` on both sides for API auth.
+/// Generate two independent tokens for bidirectional peer authentication.
+///
+/// - `token_ab` (source -> new): plaintext stored in source's `.peer_tokens/{new_name}.token`
+/// - `token_ba` (new -> source): plaintext stored in new's `.peer_tokens/{source_name}.token`
+///
+/// Both SHA-256 hashes are written to both configs' `paired_tokens` so each
+/// gateway accepts requests authenticated with either token.
 fn exchange_peer_tokens(
     source_config_dir: &Path,
     new_config_dir: &Path,
@@ -353,8 +389,12 @@ fn exchange_peer_tokens(
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
 
-    let plaintext = uuid::Uuid::new_v4().to_string();
-    let hash_hex = format!("{:x}", Sha256::digest(plaintext.as_bytes()));
+    // Two independent tokens: one per direction
+    let token_ab = uuid::Uuid::new_v4().to_string(); // source uses to call new
+    let token_ba = uuid::Uuid::new_v4().to_string(); // new uses to call source
+
+    let hash_ab = format!("{:x}", Sha256::digest(token_ab.as_bytes()));
+    let hash_ba = format!("{:x}", Sha256::digest(token_ba.as_bytes()));
 
     let source_name = workspace_name_from_dir(
         &source_config_dir
@@ -363,13 +403,16 @@ fn exchange_peer_tokens(
             .to_string_lossy(),
     );
 
-    // Write plaintext tokens for HTTP auth
-    write_peer_token(source_config_dir, new_name, &plaintext)?;
-    write_peer_token(new_config_dir, &source_name, &plaintext)?;
+    // Source stores token_ab (what it presents when calling new)
+    write_peer_token(source_config_dir, new_name, &token_ab)?;
+    // New stores token_ba (what it presents when calling source)
+    write_peer_token(new_config_dir, &source_name, &token_ba)?;
 
-    // Append hash to both configs' paired_tokens
-    append_paired_token_hash(source_config_dir, &hash_hex)?;
-    append_paired_token_hash(new_config_dir, &hash_hex)?;
+    // Both gateways must accept both hashes for bidirectional auth
+    append_paired_token_hash(source_config_dir, &hash_ab)?;
+    append_paired_token_hash(source_config_dir, &hash_ba)?;
+    append_paired_token_hash(new_config_dir, &hash_ab)?;
+    append_paired_token_hash(new_config_dir, &hash_ba)?;
 
     Ok(())
 }
@@ -381,25 +424,85 @@ fn write_peer_token(config_dir: &Path, peer_name: &str, plaintext: &str) -> Resu
     let token_path = tokens_dir.join(format!("{peer_name}.token"));
     std::fs::write(&token_path, plaintext)
         .with_context(|| format!("Failed to write {}", token_path.display()))?;
+
+    // Restrict token file to owner-only read/write (0600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", token_path.display()))?;
+    }
+
     Ok(())
 }
 
+/// Append a hash to `gateway.paired_tokens` via text-level editing to preserve
+/// comments, field ordering, and encrypted secrets in the original TOML.
 fn append_paired_token_hash(config_dir: &Path, hash_hex: &str) -> Result<()> {
     let config_path = config_dir.join("config.toml");
     let toml_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
-    let mut config: Config =
-        toml::from_str(&toml_str).context("Failed to parse config.toml for token injection")?;
 
-    if !config.gateway.paired_tokens.contains(&hash_hex.to_string()) {
-        config.gateway.paired_tokens.push(hash_hex.to_string());
+    // Minimal struct to extract only paired_tokens without requiring full Config parse.
+    #[derive(Default, serde::Deserialize)]
+    struct GatewayTokens {
+        #[serde(default)]
+        paired_tokens: Vec<String>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct MinimalConfig {
+        #[serde(default)]
+        gateway: GatewayTokens,
     }
 
-    // Re-serialize only the gateway.paired_tokens field back into the TOML.
-    // Full re-serialization would lose comments and field ordering, so we do a
-    // targeted edit: find the `[gateway]` section and upsert `paired_tokens`.
-    let updated_toml = toml::to_string_pretty(&config)
-        .context("Failed to serialize config with new paired_tokens")?;
+    let existing: MinimalConfig =
+        toml::from_str(&toml_str).context("Failed to parse config.toml for token injection")?;
+
+    if existing.gateway.paired_tokens.contains(&hash_hex.to_string()) {
+        return Ok(()); // already present
+    }
+
+    // Build the updated paired_tokens array value
+    let mut new_tokens = existing.gateway.paired_tokens.clone();
+    new_tokens.push(hash_hex.to_string());
+    let new_value = format!(
+        "paired_tokens = [{}]",
+        new_tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Text-level replacement: find and replace the existing paired_tokens line,
+    // or insert one under [gateway] if absent.
+    let updated_toml = if let Some(start) = toml_str.find("paired_tokens") {
+        let line_start = toml_str[..start].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = toml_str[start..]
+            .find('\n')
+            .map_or(toml_str.len(), |i| start + i);
+        format!(
+            "{}{}{}",
+            &toml_str[..line_start],
+            new_value,
+            &toml_str[line_end..]
+        )
+    } else if let Some(gw_pos) = toml_str.find("[gateway]") {
+        // No paired_tokens line — insert after [gateway] header
+        let after_header = toml_str[gw_pos..]
+            .find('\n')
+            .map_or(toml_str.len(), |i| gw_pos + i + 1);
+        format!(
+            "{}{}\n{}",
+            &toml_str[..after_header],
+            new_value,
+            &toml_str[after_header..]
+        )
+    } else {
+        // No [gateway] section at all — append one
+        format!("{}\n[gateway]\n{}\n", toml_str, new_value)
+    };
+
     std::fs::write(&config_path, updated_toml)
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
 
@@ -417,10 +520,11 @@ fn list_workspaces(current_config: &Config) -> Result<()> {
     let workspaces = discover_workspaces(active_config_dir.as_deref())?;
 
     println!("Workspaces:\n");
-    println!("  {e:3} {n:<16} {p:>6}  {s:<15} {t}",
-        e = "", n = "NAME", p = "PORT", s = "STATUS", t = "PATH");
-    println!("  {e:3} {n:<16} {p:>6}  {s:<15} {t}",
-        e = "", n = "────", p = "────", s = "──────", t = "────");
+    let hdr = |n: &str, p: &str, s: &str, t: &str| {
+        format!("       {n:<16} {p:>6}  {s:<15} {t}")
+    };
+    println!("{}", hdr("NAME", "PORT", "STATUS", "PATH"));
+    println!("{}", hdr("────", "────", "──────", "────"));
 
     if workspaces.is_empty() {
         println!("  (no workspaces found)");
@@ -502,10 +606,16 @@ fn start_workspace(name: Option<&str>, config: &Config) -> Result<()> {
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("Failed to create logs dir: {}", logs_dir.display()))?;
 
-        let stdout_file = std::fs::File::create(logs_dir.join("daemon.stdout.log"))
-            .context("Failed to create stdout log")?;
-        let stderr_file = std::fs::File::create(logs_dir.join("daemon.stderr.log"))
-            .context("Failed to create stderr log")?;
+        let stdout_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs_dir.join("daemon.stdout.log"))
+            .context("Failed to open stdout log")?;
+        let stderr_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(logs_dir.join("daemon.stderr.log"))
+            .context("Failed to open stderr log")?;
 
         let config_dir_str = ws.config_dir.to_string_lossy().to_string();
 
@@ -574,7 +684,7 @@ fn stop_workspace(name: Option<&str>, all: bool, config: &Config) -> Result<()> 
 
         match ws.running {
             RunStatus::Running { pid } => {
-                stop_pid(pid, &ws.name)?;
+                stop_pid(pid, &ws.name, &ws.config_dir)?;
             }
             RunStatus::Stale => {
                 let _ = std::fs::remove_file(ws.config_dir.join("daemon.pid"));
@@ -590,8 +700,9 @@ fn stop_workspace(name: Option<&str>, all: bool, config: &Config) -> Result<()> 
 }
 
 /// Send SIGTERM, wait up to 5s, then SIGKILL if still alive.
+/// Cleans up the PID file after successful termination.
 #[cfg(unix)]
-fn stop_pid(pid: u32, name: &str) -> Result<()> {
+fn stop_pid(pid: u32, name: &str, config_dir: &Path) -> Result<()> {
     let pid_i32 = pid as libc::pid_t;
 
     // SIGTERM
@@ -603,6 +714,7 @@ fn stop_pid(pid: u32, name: &str) -> Result<()> {
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !is_pid_alive(pid) {
+            let _ = std::fs::remove_file(config_dir.join("daemon.pid"));
             println!("Stopped '{name}' (PID {pid}).");
             return Ok(());
         }
@@ -618,12 +730,13 @@ fn stop_pid(pid: u32, name: &str) -> Result<()> {
         bail!("Failed to kill daemon for '{name}' (PID {pid})");
     }
 
+    let _ = std::fs::remove_file(config_dir.join("daemon.pid"));
     println!("Killed '{name}' (PID {pid}, SIGKILL).");
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn stop_pid(_pid: u32, name: &str) -> Result<()> {
+fn stop_pid(_pid: u32, _name: &str, _config_dir: &Path) -> Result<()> {
     bail!("Stopping daemons is only supported on Unix systems");
 }
 
@@ -751,5 +864,99 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("daemon.pid"), "0").unwrap();
         assert_eq!(read_pid_file(dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_peer_token_sets_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_peer_token(dir.path(), "test-peer", "secret-token").unwrap();
+        let meta = std::fs::metadata(dir.path().join(".peer_tokens/test-peer.token")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_peer_token_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_peer_token(dir.path(), "peer1", "my-token").unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".peer_tokens/peer1.token")).unwrap();
+        assert_eq!(content, "my-token");
+    }
+
+    #[test]
+    fn append_paired_token_hash_adds_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[gateway]\nport = 37173\npaired_tokens = [\"aaa\"]\n",
+        )
+        .unwrap();
+        append_paired_token_hash(dir.path(), "bbb").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(content.contains("\"aaa\""));
+        assert!(content.contains("\"bbb\""));
+    }
+
+    #[test]
+    fn append_paired_token_hash_skips_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[gateway]\nport = 37173\npaired_tokens = [\"aaa\"]\n",
+        )
+        .unwrap();
+        append_paired_token_hash(dir.path(), "aaa").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        // Should still be just one "aaa", not duplicated
+        assert_eq!(content.matches("\"aaa\"").count(), 1);
+    }
+
+    #[test]
+    fn append_paired_token_hash_inserts_under_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "api_key = \"test\"\n\n[gateway]\nport = 37173\n",
+        )
+        .unwrap();
+        append_paired_token_hash(dir.path(), "newhash").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(content.contains("\"newhash\""));
+        // Verify original content preserved
+        assert!(content.contains("api_key = \"test\""));
+        assert!(content.contains("port = 37173"));
+    }
+
+    #[test]
+    fn append_paired_token_hash_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "# Main config\napi_key = \"test\"\n\n[gateway]\n# Gateway settings\nport = 37173\npaired_tokens = []\n",
+        )
+        .unwrap();
+        append_paired_token_hash(dir.path(), "abc123").unwrap();
+        let content = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(content.contains("# Main config"));
+        assert!(content.contains("# Gateway settings"));
+        assert!(content.contains("\"abc123\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_daemon_lock_held_unlocked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.pid"), "99999").unwrap();
+        // No flock held — should return false
+        assert!(!is_daemon_lock_held(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_daemon_lock_held_no_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // No daemon.pid file — should return false
+        assert!(!is_daemon_lock_held(dir.path()));
     }
 }

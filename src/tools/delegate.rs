@@ -481,6 +481,21 @@ impl DelegateTool {
     ) -> anyhow::Result<ToolResult> {
         use crate::workspace::{discover_workspaces, RunStatus};
 
+        // Hard cap on remote delegation depth to prevent infinite HTTP loops
+        // between peers that mutually configure remote delegation.
+        const MAX_REMOTE_DELEGATION_DEPTH: u32 = 5;
+        if self.depth >= MAX_REMOTE_DELEGATION_DEPTH {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Remote delegation depth limit reached ({}/{}). Refusing to delegate further.",
+                    self.depth, MAX_REMOTE_DELEGATION_DEPTH
+                )),
+                error_kind: None,
+            });
+        }
+
         let self_config_dir = self
             .provider_runtime_options
             .zeroclaw_dir
@@ -530,42 +545,40 @@ impl DelegateTool {
 
         let url = format!("http://{}:{}/webhook", target.host, target.port);
 
+        // Warn if delegating over non-loopback — bearer token travels in plaintext.
+        if target.host != "127.0.0.1" && target.host != "localhost" && target.host != "::1" {
+            tracing::warn!(
+                "Remote delegation to '{}' uses non-loopback host {} — bearer token is sent over plaintext HTTP",
+                remote_ws, target.host
+            );
+        }
+
         let client = crate::config::build_runtime_proxy_client_with_timeouts(
             "delegate.remote",
             DELEGATE_TIMEOUT_SECS,
             10,
         );
 
-        let resp = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
-            client
-                .post(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .header("Content-Type", "application/json")
-                .json(&serde_json::json!({ "message": full_prompt }))
-                .send(),
-        )
-        .await;
-
-        let resp = match resp {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+        let resp = match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("X-Delegation-Depth", (self.depth + 1).to_string())
+            .json(&serde_json::json!({ "message": full_prompt }))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = if e.is_timeout() {
+                    format!("Remote delegation to '{remote_ws}' timed out after {DELEGATE_TIMEOUT_SECS}s")
+                } else {
+                    format!("Remote delegation to '{remote_ws}' failed: {e}")
+                };
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Remote delegation to '{remote_ws}' failed: {e}"
-                    )),
-                    error_kind: None,
-                });
-            }
-            Err(_) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Remote delegation to '{remote_ws}' timed out after {DELEGATE_TIMEOUT_SECS}s"
-                    )),
+                    error: Some(msg),
                     error_kind: None,
                 });
             }
@@ -584,7 +597,8 @@ impl DelegateTool {
             Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "[Agent '{agent_name}' via remote '{remote_ws}']\n{output}"
+                    "[Agent '{agent_name}' via remote '{remote_ws}' (depth={depth}, uses remote daemon config)]\n{output}",
+                    depth = self.depth
                 ),
                 error: None,
                 error_kind: None,
