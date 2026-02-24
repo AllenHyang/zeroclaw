@@ -100,6 +100,7 @@ Notes:
 - `zeroclaw workspace switch <name>`
 - `zeroclaw workspace start [<name>]`
 - `zeroclaw workspace stop [<name>] [--all]`
+- `zeroclaw workspace rename <old_name> <new_name>`
 
 Notes:
 
@@ -109,6 +110,7 @@ Notes:
 - `start` without a name starts all stopped workspaces. `stop --all` stops all running ones.
 - `switch` sets the active workspace marker at `~/.zeroclaw/active_workspace.toml`; requires daemon restart to take effect.
 - Workspace names may only contain `[a-zA-Z0-9_-]` and must not start with `.` or `-`. The name `default` is reserved.
+- `rename` renames a workspace directory, updates peer token files, peer config `remote` references, and TLS peer CA filenames across all other workspaces. The workspace must be stopped before renaming.
 - Cross-workspace delegation uses `[agents.<name>].remote` — see [config-reference.md](config-reference.md).
 
 ### `cron`

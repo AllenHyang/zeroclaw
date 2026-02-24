@@ -196,6 +196,13 @@ pub enum WorkspaceCommands {
         #[arg(long)]
         all: bool,
     },
+    /// Rename an existing workspace
+    Rename {
+        /// Current workspace name
+        old_name: String,
+        /// New workspace name
+        new_name: String,
+    },
 }
 
 /// Migration subcommands
