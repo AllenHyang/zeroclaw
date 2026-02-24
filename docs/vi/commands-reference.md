@@ -2,7 +2,7 @@
 
 Dựa trên CLI hiện tại (`zeroclaw --help`).
 
-Xác minh lần cuối: **2026-02-20**.
+Xác minh lần cuối: **2026-02-24**.
 
 ## Lệnh cấp cao nhất
 
@@ -25,6 +25,7 @@ Xác minh lần cuối: **2026-02-20**.
 | `config` | Xuất schema cấu hình dạng máy đọc được |
 | `completions` | Tạo script tự hoàn thành cho shell ra stdout |
 | `hardware` | Phát hiện và kiểm tra phần cứng USB |
+| `workspace` | Quản lý nhiều workspace instance |
 | `peripheral` | Cấu hình và nạp firmware thiết bị ngoại vi |
 
 ## Nhóm lệnh
@@ -57,6 +58,24 @@ Xác minh lần cuối: **2026-02-20**.
 - `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
+
+### `workspace`
+
+- `zeroclaw workspace list`
+- `zeroclaw workspace clone <name> [--port <PORT>] [--switch]`
+- `zeroclaw workspace switch <name>`
+- `zeroclaw workspace start [<name>]`
+- `zeroclaw workspace stop [<name>] [--all]`
+
+Lưu ý:
+
+- Mỗi workspace là một instance ZeroClaw cách ly với config, daemon, brain.db và gateway port riêng.
+- Workspace mặc định nằm tại `~/.zeroclaw/`; workspace có tên tại `~/.zeroclaw-<name>/`.
+- `clone` sao chép config từ workspace hiện tại, tự gán port (max+1), tạo secret key mới, và trao đổi peer token hai chiều để xác thực lẫn nhau.
+- `start` không có tên sẽ khởi động tất cả workspace đang dừng. `stop --all` dừng tất cả đang chạy.
+- `switch` đặt marker workspace đang dùng tại `~/.zeroclaw/active_workspace.toml`; cần khởi động lại daemon để có hiệu lực.
+- Tên workspace chỉ chứa `[a-zA-Z0-9_-]`, không bắt đầu bằng `.` hoặc `-`. Tên `default` được bảo lưu.
+- Ủy quyền xuyên workspace dùng `[agents.<name>].remote` — xem [config-reference.md](config-reference.md).
 
 ### `cron`
 

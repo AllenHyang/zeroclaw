@@ -2,13 +2,21 @@
 
 This is a high-signal reference for common config sections and defaults.
 
-Last verified: **February 21, 2026**.
+Last verified: **February 24, 2026**.
 
 Config path resolution at startup:
 
-1. `ZEROCLAW_WORKSPACE` override (if set)
-2. persisted `~/.zeroclaw/active_workspace.toml` marker (if present)
-3. default `~/.zeroclaw/config.toml`
+1. `--config-dir <path>` CLI override (used by `workspace start` to launch per-workspace daemons)
+2. `ZEROCLAW_WORKSPACE` environment override (if set)
+3. persisted `~/.zeroclaw/active_workspace.toml` marker (if present)
+4. default `~/.zeroclaw/config.toml`
+
+Multi-workspace layout:
+
+- Default workspace: `~/.zeroclaw/` (config, brain.db, logs, daemon state)
+- Named workspaces: `~/.zeroclaw-<name>/` (same structure, isolated data)
+- Each workspace runs its own daemon process on a unique gateway port
+- Create with `zeroclaw workspace clone <name>`; see [commands-reference.md](commands-reference.md)
 
 ZeroClaw logs the resolved config on startup at `INFO` level:
 
@@ -150,12 +158,16 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `agentic` | `false` | Enable multi-turn tool-call loop mode for the sub-agent |
 | `allowed_tools` | `[]` | Tool allowlist for agentic mode |
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
+| `remote` | unset | Remote workspace name for cross-workspace delegation |
 
 Notes:
 
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- When `remote` is set, the delegate tool forwards the prompt to the named workspace's daemon via HTTP instead of creating a local provider. The remote daemon uses its own config (provider, model, tools). Authentication uses peer tokens exchanged during `workspace clone`.
+- Remote delegation depth is capped at 5 to prevent infinite loops between peers.
+- On non-loopback hosts, if the target workspace has `tls_cert` configured, `https://` is used automatically.
 
 ```toml
 [agents.researcher]
@@ -171,6 +183,12 @@ max_iterations = 8
 provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
+
+# Remote delegation: forward to a peer workspace daemon
+[agents.agent2]
+provider = "anthropic"       # ignored when remote is set (peer uses its own config)
+model = "claude-sonnet-4-6"  # ignored when remote is set
+remote = "agent2"            # workspace name from `zeroclaw workspace list`
 ```
 
 ## `[runtime]`
@@ -320,6 +338,21 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `paired_tokens` | `[]` | SHA-256 hashed bearer tokens (managed automatically during `workspace clone`) |
+| `pair_rate_limit_per_minute` | `10` | max `/pair` requests per minute per client key |
+| `webhook_rate_limit_per_minute` | `60` | max `/webhook` requests per minute per client key |
+| `trust_forwarded_headers` | `false` | trust `X-Forwarded-For` / `X-Real-IP`; enable only behind a trusted reverse proxy |
+| `rate_limit_max_keys` | `10000` | max distinct client keys tracked by rate limiter |
+| `idempotency_ttl_secs` | `300` | TTL for webhook idempotency keys |
+| `idempotency_max_keys` | `10000` | max distinct idempotency keys retained |
+| `tls_cert` | unset | path to TLS certificate (PEM); when set with `tls_key`, enables HTTPS on gateway |
+| `tls_key` | unset | path to TLS private key (PEM) |
+
+Notes:
+
+- `paired_tokens` are exchanged automatically during `workspace clone` and should not be edited manually.
+- `tls_cert` / `tls_key` are currently used by the delegate client for scheme selection: when the target workspace has TLS configured and the host is non-loopback, remote delegation uses `https://`. Gateway TLS listener support is planned but not yet active.
+- Peer CA certificates can be placed at `{config_dir}/tls/peers/{workspace_name}-ca.pem` for custom CA trust during cross-workspace delegation.
 
 ## `[autonomy]`
 

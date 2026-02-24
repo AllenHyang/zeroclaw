@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 21, 2026**.
+Last verified: **February 24, 2026**.
 
 ## Top-Level Commands
 
@@ -26,6 +26,7 @@ Last verified: **February 21, 2026**.
 | `config` | Export machine-readable config schema |
 | `completions` | Generate shell completion scripts to stdout |
 | `hardware` | Discover and introspect USB hardware |
+| `workspace` | Manage multiple workspace instances |
 | `peripheral` | Configure and flash peripherals |
 
 ## Command Groups
@@ -91,6 +92,24 @@ Notes:
 - `zeroclaw service restart`
 - `zeroclaw service status`
 - `zeroclaw service uninstall`
+
+### `workspace`
+
+- `zeroclaw workspace list`
+- `zeroclaw workspace clone <name> [--port <PORT>] [--switch]`
+- `zeroclaw workspace switch <name>`
+- `zeroclaw workspace start [<name>]`
+- `zeroclaw workspace stop [<name>] [--all]`
+
+Notes:
+
+- Each workspace is an isolated ZeroClaw instance with its own config, daemon, brain.db, and gateway port.
+- The default workspace lives at `~/.zeroclaw/`; named workspaces at `~/.zeroclaw-<name>/`.
+- `clone` copies config from the current workspace, auto-assigns a port (max+1), generates a new secret key, and exchanges bidirectional peer tokens for mutual authentication.
+- `start` without a name starts all stopped workspaces. `stop --all` stops all running ones.
+- `switch` sets the active workspace marker at `~/.zeroclaw/active_workspace.toml`; requires daemon restart to take effect.
+- Workspace names may only contain `[a-zA-Z0-9_-]` and must not start with `.` or `-`. The name `default` is reserved.
+- Cross-workspace delegation uses `[agents.<name>].remote` — see [config-reference.md](config-reference.md).
 
 ### `cron`
 
