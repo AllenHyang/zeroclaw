@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::goals::engine::GoalState;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -143,6 +144,50 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 }
             }
         }));
+    }
+
+    // ── Auto-start peer workspaces ──
+    // If delegate agents with `remote` are configured, start those workspaces
+    // automatically so the multi-agent team comes up together.
+    {
+        let peer_names: Vec<String> = config
+            .agents
+            .iter()
+            .filter_map(|(_, ac)| ac.remote.clone())
+            .collect();
+        if !peer_names.is_empty() {
+            let bin = config
+                .config_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("bin/zeroclaw");
+            for name in &peer_names {
+                let output = std::process::Command::new(&bin)
+                    .args(["workspace", "start", name])
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {
+                        let msg = String::from_utf8_lossy(&o.stdout);
+                        tracing::info!("Auto-started peer workspace '{name}': {}", msg.trim());
+                    }
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        // "already running" is fine
+                        if err.contains("already running") {
+                            tracing::info!("Peer workspace '{name}' already running");
+                        } else {
+                            tracing::warn!(
+                                "Failed to start peer workspace '{name}': {}",
+                                err.trim()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to start peer workspace '{name}': {e}");
+                    }
+                }
+            }
+        }
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -575,6 +620,10 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
     let mut daily_exploration_count: u32 = 0;
     let mut last_exploration_date: Option<chrono::NaiveDate> = None;
 
+    // Consecutive load failures — auto-recover after threshold
+    let mut consecutive_load_failures: u32 = 0;
+    const MAX_LOAD_FAILURES_BEFORE_RESET: u32 = 5;
+
     loop {
         tokio::time::sleep(next_delay).await;
 
@@ -606,17 +655,54 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
         );
 
         let mut state = match engine.load_and_normalize().await {
-            Ok(s) => s,
+            Ok(s) => {
+                consecutive_load_failures = 0;
+                s
+            }
             Err(e) => {
-                tracing::warn!("Goal loop: failed to load state: {e}");
-                next_delay = idle_interval;
-                continue;
+                consecutive_load_failures += 1;
+                if consecutive_load_failures >= MAX_LOAD_FAILURES_BEFORE_RESET {
+                    tracing::error!(
+                        failures = consecutive_load_failures,
+                        "Goal loop: state corrupted after {consecutive_load_failures} consecutive failures, backing up and resetting"
+                    );
+                    // Backup corrupted file
+                    let goals_path = config.workspace_dir.join("state/goals.json");
+                    let backup_path = config.workspace_dir.join(format!(
+                        "state/goals.corrupted.{}.json",
+                        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                    ));
+                    let _ = tokio::fs::copy(&goals_path, &backup_path).await;
+                    // Reset to empty state
+                    let empty = GoalState::default();
+                    let _ = engine.save_state(&empty).await;
+                    consecutive_load_failures = 0;
+                    tracing::info!(
+                        "Goal loop: state reset to empty, corrupted file backed up to {}",
+                        backup_path.display()
+                    );
+                    empty
+                } else {
+                    tracing::warn!(
+                        failures = consecutive_load_failures,
+                        "Goal loop: failed to load state ({consecutive_load_failures}/{MAX_LOAD_FAILURES_BEFORE_RESET}): {e}"
+                    );
+                    next_delay = idle_interval;
+                    continue;
+                }
             }
         };
 
         // Default to idle; will be shortened to active_interval at end of
         // loop body if actionable goals remain after this cycle.
         next_delay = idle_interval;
+
+        // ── Archive stale completed/cancelled goals ──────────────────
+        // Goals that have been terminal for >1 hour are moved to
+        // goals_archive.json to keep the active state lean.
+        let _ = engine
+            .archive_completed_goals(&mut state, chrono::Duration::hours(1))
+            .await;
 
         // ── Auto-approve: promote pending goals ──────────────────────
         {

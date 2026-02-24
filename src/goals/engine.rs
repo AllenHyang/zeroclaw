@@ -7,6 +7,50 @@ use std::path::{Path, PathBuf};
 /// Maximum retry attempts per step before marking the goal as blocked.
 const MAX_STEP_ATTEMPTS: u32 = 3;
 
+/// Attempt to repair common JSON errors produced by LLMs writing goals.json directly.
+/// Handles: smart/curly quotes → straight quotes, unescaped newlines in strings.
+fn repair_json_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut prev_was_escape = false;
+
+    for ch in input.chars() {
+        if prev_was_escape {
+            out.push(ch);
+            prev_was_escape = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            out.push(ch);
+            prev_was_escape = true;
+            continue;
+        }
+        match ch {
+            '"' if !in_string => {
+                in_string = true;
+                out.push('"');
+            }
+            '"' if in_string => {
+                in_string = false;
+                out.push('"');
+            }
+            // Smart/curly quotes inside JSON strings → escaped straight quotes
+            '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}' if in_string => {
+                out.push_str("\\\"");
+            }
+            // Smart/curly quotes outside strings → straight quotes
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            // Unescaped newlines inside strings
+            '\n' if in_string => out.push_str("\\n"),
+            '\r' if in_string => out.push_str("\\r"),
+            '\t' if in_string => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Maximum characters retained in `working_memory` between autonomous sessions.
 const MAX_WORKING_MEMORY_CHARS: usize = 2000;
 
@@ -280,8 +324,28 @@ impl GoalEngine {
         if bytes.is_empty() {
             return Ok(GoalState::default());
         }
-        let state: GoalState = serde_json::from_slice(&bytes)?;
-        Ok(state)
+        match serde_json::from_slice::<GoalState>(&bytes) {
+            Ok(state) => Ok(state),
+            Err(original_err) => {
+                // LLM may write malformed JSON (unescaped quotes, smart quotes, etc).
+                // Attempt common repairs before giving up.
+                let text = String::from_utf8_lossy(&bytes);
+                let repaired = repair_json_string(&text);
+                match serde_json::from_str::<GoalState>(&repaired) {
+                    Ok(state) => {
+                        tracing::info!(
+                            "Loaded goals.json after JSON repair (original error: {original_err})"
+                        );
+                        // Persist the repaired version
+                        if let Ok(clean) = serde_json::to_vec_pretty(&state) {
+                            let _ = tokio::fs::write(&self.state_path, clean).await;
+                        }
+                        Ok(state)
+                    }
+                    Err(_) => Err(original_err.into()),
+                }
+            }
+        }
     }
 
     /// Atomic save: write to .tmp then rename.
@@ -1028,6 +1092,105 @@ impl GoalEngine {
 
         prompt
     }
+
+    // ── Archival ──────────────────────────────────────────────────
+
+    /// Archive completed/cancelled goals whose notification has been delivered
+    /// (or that have been terminal for at least `min_age`).
+    ///
+    /// Archived goals are appended to `{workspace}/state/goals_archive.json`
+    /// and removed from the active state. Returns the number of goals archived.
+    pub async fn archive_completed_goals(
+        &self,
+        state: &mut GoalState,
+        min_age: chrono::Duration,
+    ) -> Result<usize> {
+        let now = chrono::Utc::now();
+        let mut to_archive = Vec::new();
+        let mut keep = Vec::new();
+
+        for goal in state.goals.drain(..) {
+            let is_terminal =
+                goal.status == GoalStatus::Completed || goal.status == GoalStatus::Cancelled;
+            if !is_terminal {
+                keep.push(goal);
+                continue;
+            }
+
+            // Check age: goal must have been terminal for at least `min_age`.
+            let old_enough = chrono::DateTime::parse_from_rfc3339(&goal.updated_at)
+                .map(|t| now.signed_duration_since(t) >= min_age)
+                .unwrap_or(true); // If unparseable, archive it
+
+            // Archive if old enough AND notification was delivered (or no channel configured).
+            if old_enough && goal.last_notification_delivered {
+                to_archive.push(goal);
+            } else if old_enough {
+                // Terminal + old enough but notification not delivered — archive anyway
+                // to prevent unbounded accumulation. The notification was best-effort.
+                to_archive.push(goal);
+            } else {
+                keep.push(goal);
+            }
+        }
+
+        state.goals = keep;
+
+        if to_archive.is_empty() {
+            return Ok(0);
+        }
+
+        let count = to_archive.len();
+
+        // Append to archive file
+        let archive_path = self.state_path.with_file_name("goals_archive.json");
+        let mut archive: GoalArchive = if archive_path.exists() {
+            let bytes = tokio::fs::read(&archive_path).await.unwrap_or_default();
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else {
+            GoalArchive::default()
+        };
+
+        let archived_at = now.to_rfc3339();
+        for goal in to_archive {
+            archive.archived.push(ArchivedGoal {
+                archived_at: archived_at.clone(),
+                goal,
+            });
+        }
+
+        // Cap archive size: keep only the most recent 200 entries
+        const MAX_ARCHIVE_ENTRIES: usize = 200;
+        if archive.archived.len() > MAX_ARCHIVE_ENTRIES {
+            let drain_count = archive.archived.len() - MAX_ARCHIVE_ENTRIES;
+            archive.archived.drain(..drain_count);
+        }
+
+        let tmp = archive_path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(&archive)?;
+        tokio::fs::write(&tmp, &data).await?;
+        tokio::fs::rename(&tmp, &archive_path).await?;
+
+        // Save the trimmed active state
+        self.save_state(state).await?;
+
+        tracing::info!("Archived {count} completed/cancelled goal(s)");
+        Ok(count)
+    }
+}
+
+/// Wrapper for the archive file at `{workspace}/state/goals_archive.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GoalArchive {
+    #[serde(default)]
+    pub archived: Vec<ArchivedGoal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedGoal {
+    pub archived_at: String,
+    #[serde(flatten)]
+    pub goal: Goal,
 }
 
 #[cfg(test)]
