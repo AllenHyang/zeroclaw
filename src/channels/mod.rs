@@ -445,10 +445,14 @@ async fn build_active_goals_summary(workspace_dir: &Path) -> String {
 
     let mut out = String::from(
         "== Active Goals (read from state/goals.json) ==\n\
-         When the user's message provides new information, corrections, or feedback \
-         that relates to one of these goals, you SHOULD proactively update the goal \
-         in state/goals.json (e.g. revise description, update working_memory, adjust \
-         steps, change status). Do NOT wait for the user to explicitly ask.\n\n",
+         IMPORTANT: First determine whether the user's message is an independent question/topic \
+         or directly related to one of these goals. Most user messages are independent questions — \
+         answer them directly without modifying any goal state.\n\
+         Only update a goal when the user's message EXPLICITLY and CLEARLY refers to that specific \
+         goal (e.g. by goal ID, exact task name, or unambiguous continuation of a prior conversation \
+         about that goal). Do NOT force-associate loosely related keywords with existing goals.\n\
+         When you do update a goal, use file_edit on state/goals.json (e.g. revise description, \
+         update working_memory, adjust steps, change status).\n\n",
     );
 
     for g in &active {
