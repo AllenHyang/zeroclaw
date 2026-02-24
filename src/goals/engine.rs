@@ -3301,4 +3301,48 @@ max_steps_per_cycle = 3
             "should preserve completed goal step results"
         );
     }
+
+    #[test]
+    fn repair_json_smart_quotes() {
+        // Smart quotes inside a JSON string value — LLM writes these unescaped
+        let broken =
+            "{\"goals\":[{\"id\":\"g1\",\"description\":\"test\",\"working_memory\":\"搜索\u{201C}hello\u{201D}完成\"}]}";
+        let repaired = repair_json_string(broken);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&repaired);
+        assert!(parsed.is_ok(), "repaired JSON should parse: {repaired}");
+    }
+
+    #[test]
+    fn repair_json_passthrough_valid() {
+        let valid = r#"{"goals":[{"id":"g1","description":"hello world"}]}"#;
+        let repaired = repair_json_string(valid);
+        assert_eq!(repaired, valid, "valid JSON should pass through unchanged");
+    }
+
+    #[tokio::test]
+    async fn load_state_repairs_smart_quotes() {
+        let tmp = TempDir::new().unwrap();
+        let engine = GoalEngine::new(tmp.path());
+
+        // Write broken JSON with smart quotes (simulating LLM output)
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let broken = r#"{
+  "goals": [{
+    "id": "g1",
+    "description": "test goal",
+    "status": "completed",
+    "working_memory": "搜索"#
+            .to_string()
+            + "\u{201C}ZeroClaw\u{201D}"
+            + r#"完成"
+  }]
+}"#;
+        std::fs::write(state_dir.join("goals.json"), &broken).unwrap();
+
+        // Should auto-repair and load successfully
+        let state = engine.load_state().await.unwrap();
+        assert_eq!(state.goals.len(), 1);
+        assert_eq!(state.goals[0].id, "g1");
+    }
 }

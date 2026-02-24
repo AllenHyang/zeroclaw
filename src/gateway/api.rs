@@ -1053,7 +1053,10 @@ pub async fn handle_api_peers(
     }
 
     let config = state.config.lock().clone();
-    let self_dir = config.config_path.parent().map(std::path::Path::to_path_buf);
+    let self_dir = config
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf);
 
     let workspaces = match crate::workspace::discover_workspaces(self_dir.as_deref()) {
         Ok(w) => w,

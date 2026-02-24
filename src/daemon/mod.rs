@@ -459,7 +459,7 @@ async fn deliver_notification(
     config: &Config,
     channel_name: &str,
     target: &str,
-    title: &str,
+    _title: &str,
     output: &str,
 ) -> Result<()> {
     use crate::channels::{Channel, SendMessage};
@@ -718,7 +718,11 @@ async fn run_goal_loop_worker(mut config: Config) -> Result<()> {
                     GoalExecutionMode::Autonomous
                 };
                 for goal in &mut state.goals {
-                    if goal.status != GoalStatus::Pending || goal.steps.is_empty() {
+                    if goal.status != GoalStatus::Pending {
+                        continue;
+                    }
+                    // Stepped goals need steps to execute; autonomous goals don't.
+                    if goal.execution_mode == GoalExecutionMode::Stepped && goal.steps.is_empty() {
                         continue;
                     }
                     if approve_all || (approve_low && goal.priority == GoalPriority::Low) {

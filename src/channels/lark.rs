@@ -293,6 +293,8 @@ pub struct LarkChannel {
     max_draft_edits: u32,
     /// Per-message edit count tracker
     draft_edit_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// Cached bot open_id for group-chat mention filtering.
+    bot_open_id: Arc<RwLock<Option<String>>>,
 }
 
 impl LarkChannel {
@@ -335,6 +337,7 @@ impl LarkChannel {
             draft_update_interval_ms: 3000,
             max_draft_edits: 20,
             draft_edit_counts: Arc::new(Mutex::new(HashMap::new())),
+            bot_open_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -623,6 +626,18 @@ impl LarkChannel {
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
+        // Pre-fetch bot open_id for group-chat mention filtering.
+        tracing::info!(
+            "Lark: api_base={}, platform={:?}",
+            self.api_base(),
+            self.platform
+        );
+        if let Some(id) = self.get_bot_open_id().await {
+            tracing::info!("Lark: bot open_id = {id}");
+        } else {
+            tracing::warn!("Lark: could not fetch bot open_id — group chat filtering will fall back to any-mention mode");
+        }
+
         let mut ping_secs = client_config.ping_interval.unwrap_or(120).max(10);
         let mut hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
         let mut timeout_check = tokio::time::interval(Duration::from_secs(10));
@@ -830,9 +845,18 @@ impl LarkChannel {
                     let text = text.trim().to_string();
                     if text.is_empty() { continue; }
 
-                    // Group-chat: only respond when explicitly @-mentioned
-                    if lark_msg.chat_type == "group" && !should_respond_in_group(&lark_msg.mentions) {
-                        continue;
+                    // Group-chat: only respond when this bot is explicitly @-mentioned
+                    if lark_msg.chat_type == "group" {
+                        let bot_id = self.get_bot_open_id().await;
+                        tracing::debug!(
+                            "Lark group filter: bot_id={:?}, mentions={:?}",
+                            bot_id,
+                            lark_msg.mentions,
+                        );
+                        if !should_respond_in_group(&lark_msg.mentions, bot_id.as_deref()) {
+                            tracing::debug!("Lark: skipping group message (not mentioned)");
+                            continue;
+                        }
                     }
 
                     let ack_emoji =
@@ -931,6 +955,68 @@ impl LarkChannel {
     async fn invalidate_token(&self) {
         let mut cached = self.tenant_token.write().await;
         *cached = None;
+    }
+
+    /// Get the bot's own open_id (cached after first call).
+    /// Used for group-chat mention filtering — only respond when this bot is @-mentioned.
+    async fn get_bot_open_id(&self) -> Option<String> {
+        // Check cache
+        {
+            let cached = self.bot_open_id.read().await;
+            if cached.is_some() {
+                return cached.clone();
+            }
+        }
+        // Fetch from API
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to get tenant token for bot info: {e}");
+                return None;
+            }
+        };
+        let url = format!("{}/bot/v3/info", self.api_base());
+        let resp = self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        let data: serde_json::Value = match resp {
+            Ok(r) => {
+                let status = r.status();
+                match r.text().await {
+                    Ok(text) => match serde_json::from_str(&text) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to parse bot info response: {e} (status={status}, body={})",
+                                &text[..text.len().min(200)]
+                            );
+                            return None;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("Failed to read bot info response body: {e}");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch bot info: {e}");
+                return None;
+            }
+        };
+        let open_id = data
+            .pointer("/bot/open_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(ref id) = open_id {
+            tracing::info!("Lark: bot open_id cached: {id}");
+            let mut cached = self.bot_open_id.write().await;
+            *cached = Some(id.clone());
+        }
+        open_id
     }
 
     async fn send_text_once(
@@ -1782,9 +1868,28 @@ fn strip_at_placeholders(text: &str) -> String {
     result
 }
 
-/// In group chats, only respond when the bot is explicitly @-mentioned.
-fn should_respond_in_group(mentions: &[serde_json::Value]) -> bool {
-    !mentions.is_empty()
+/// In group chats, only respond when *this* bot is explicitly @-mentioned.
+/// If `bot_open_id` is known, check that at least one mention matches it.
+/// If unknown (API call failed), do NOT respond — prevents all bots in a
+/// multi-workspace setup from replying to a single @-mention.
+fn should_respond_in_group(mentions: &[serde_json::Value], bot_open_id: Option<&str>) -> bool {
+    if mentions.is_empty() {
+        return false;
+    }
+    let Some(my_id) = bot_open_id else {
+        // Can't verify identity — deny by default (secure-by-default).
+        // Previously this returned true, causing all workspace bots to
+        // respond when any single bot was @-mentioned.
+        tracing::warn!(
+            "Lark: bot_open_id unknown, skipping group message (cannot verify @-mention target)"
+        );
+        return false;
+    };
+    mentions.iter().any(|m| {
+        m.pointer("/id/open_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| id == my_id)
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
