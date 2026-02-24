@@ -780,6 +780,14 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Path to TLS certificate (PEM). When set with `tls_key`, gateway serves HTTPS.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// Path to TLS private key (PEM).
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -828,6 +836,8 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -5821,6 +5831,8 @@ channel_id = "C123"
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(g.tls_cert.is_none());
+        assert!(g.tls_key.is_none());
     }
 
     #[test]
@@ -5852,6 +5864,8 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: Some("/tmp/key.pem".into()),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
@@ -5864,6 +5878,8 @@ channel_id = "C123"
         assert_eq!(parsed.rate_limit_max_keys, 2048);
         assert_eq!(parsed.idempotency_ttl_secs, 600);
         assert_eq!(parsed.idempotency_max_keys, 4096);
+        assert_eq!(parsed.tls_cert.as_deref(), Some("/tmp/cert.pem"));
+        assert_eq!(parsed.tls_key.as_deref(), Some("/tmp/key.pem"));
     }
 
     #[test]
@@ -7000,6 +7016,8 @@ default_model = "legacy-model"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert!(g.tls_cert.is_none());
+        assert!(g.tls_key.is_none());
     }
 
     // ── Peripherals config ───────────────────────────────────────

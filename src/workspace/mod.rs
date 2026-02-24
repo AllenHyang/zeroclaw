@@ -9,6 +9,10 @@ use crate::onboard::{scaffold_workspace, ProjectContext};
 use crate::security::SecretStore;
 use crate::WorkspaceCommands;
 
+pub mod traits;
+
+pub use traits::WorkspaceDiscovery;
+
 // ── Shared types ────────────────────────────────────────────────
 
 /// Run-state of a workspace daemon.
@@ -133,72 +137,90 @@ fn is_daemon_lock_held(_config_dir: &Path) -> bool {
     false
 }
 
-/// Scan all `.zeroclaw*` directories under home and return workspace metadata.
-pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Vec<WorkspaceInfo>> {
-    let default_dir = default_config_dir()?;
-    let home = default_dir
-        .parent()
-        .context("Home directory not found")?
-        .to_path_buf();
+/// Local filesystem workspace discovery backend.
+///
+/// Scans `~/.zeroclaw*` directories for valid workspaces.
+pub struct LocalDiscovery;
 
-    let mut workspaces = Vec::new();
-
-    for entry in std::fs::read_dir(&home).context("Failed to read home directory")? {
-        let entry = entry?;
-        let dir_name = entry.file_name();
-        let dir_name_str = dir_name.to_string_lossy().to_string();
-        // Match exactly `.zeroclaw` or `.zeroclaw-{name}` (not `.zeroclaw-backup` etc.)
-        if dir_name_str != ".zeroclaw" && !dir_name_str.starts_with(".zeroclaw-") {
-            continue;
-        }
-        // Must contain a config.toml to be a valid workspace
-        let dir_path = entry.path();
-        let config_path = dir_path.join("config.toml");
-        if !config_path.exists() {
-            continue;
-        }
-
-        let ws_name = workspace_name_from_dir(&dir_name_str);
-
-        // Read port and host from config
-        let (port, host) = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| toml::from_str::<Config>(&s).ok())
-            .map(|c| (c.gateway.port, c.gateway.host.clone()))
-            .unwrap_or((0, "127.0.0.1".to_string()));
-
-        let is_active = active_config_dir.is_some_and(|active| active == dir_path);
-
-        let running = match read_pid_file(&dir_path) {
-            Some(pid) if is_daemon_lock_held(&dir_path) && is_pid_alive(pid) => {
-                RunStatus::Running { pid }
-            }
-            Some(_) => RunStatus::Stale,
-            None => RunStatus::Stopped,
-        };
-
-        workspaces.push(WorkspaceInfo {
-            name: ws_name,
-            config_dir: dir_path,
-            port,
-            host,
-            is_active,
-            running,
-        });
+impl WorkspaceDiscovery for LocalDiscovery {
+    fn name(&self) -> &str {
+        "local"
     }
 
-    // Sort: default first, then alphabetically
-    workspaces.sort_by(|a, b| {
-        if a.name == "default" {
-            std::cmp::Ordering::Less
-        } else if b.name == "default" {
-            std::cmp::Ordering::Greater
-        } else {
-            a.name.cmp(&b.name)
-        }
-    });
+    fn discover(&self, active_config_dir: Option<&Path>) -> Result<Vec<WorkspaceInfo>> {
+        let default_dir = default_config_dir()?;
+        let home = default_dir
+            .parent()
+            .context("Home directory not found")?
+            .to_path_buf();
 
-    Ok(workspaces)
+        let mut workspaces = Vec::new();
+
+        for entry in std::fs::read_dir(&home).context("Failed to read home directory")? {
+            let entry = entry?;
+            let dir_name = entry.file_name();
+            let dir_name_str = dir_name.to_string_lossy().to_string();
+            // Match exactly `.zeroclaw` or `.zeroclaw-{name}` (not `.zeroclaw-backup` etc.)
+            if dir_name_str != ".zeroclaw" && !dir_name_str.starts_with(".zeroclaw-") {
+                continue;
+            }
+            // Must contain a config.toml to be a valid workspace
+            let dir_path = entry.path();
+            let config_path = dir_path.join("config.toml");
+            if !config_path.exists() {
+                continue;
+            }
+
+            let ws_name = workspace_name_from_dir(&dir_name_str);
+
+            // Read port and host from config
+            let (port, host) = std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| toml::from_str::<Config>(&s).ok())
+                .map(|c| (c.gateway.port, c.gateway.host.clone()))
+                .unwrap_or((0, "127.0.0.1".to_string()));
+
+            let is_active = active_config_dir.is_some_and(|active| active == dir_path);
+
+            let running = match read_pid_file(&dir_path) {
+                Some(pid) if is_daemon_lock_held(&dir_path) && is_pid_alive(pid) => {
+                    RunStatus::Running { pid }
+                }
+                Some(_) => RunStatus::Stale,
+                None => RunStatus::Stopped,
+            };
+
+            workspaces.push(WorkspaceInfo {
+                name: ws_name,
+                config_dir: dir_path,
+                port,
+                host,
+                is_active,
+                running,
+            });
+        }
+
+        // Sort: default first, then alphabetically
+        workspaces.sort_by(|a, b| {
+            if a.name == "default" {
+                std::cmp::Ordering::Less
+            } else if b.name == "default" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.name.cmp(&b.name)
+            }
+        });
+
+        Ok(workspaces)
+    }
+}
+
+/// Scan all `.zeroclaw*` directories under home and return workspace metadata.
+///
+/// Convenience wrapper over [`LocalDiscovery`]. Call sites that need a
+/// pluggable backend should accept `&dyn WorkspaceDiscovery` instead.
+pub(crate) fn discover_workspaces(active_config_dir: Option<&Path>) -> Result<Vec<WorkspaceInfo>> {
+    LocalDiscovery.discover(active_config_dir)
 }
 
 /// Find workspace index by name, or the active one if name is None.

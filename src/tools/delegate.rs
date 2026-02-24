@@ -543,20 +543,42 @@ impl DelegateTool {
         })?;
         let token = token.trim().to_string();
 
-        let url = format!("http://{}:{}/webhook", target.host, target.port);
+        let is_loopback = matches!(
+            target.host.as_str(),
+            "127.0.0.1" | "localhost" | "::1"
+        );
 
-        // Warn if delegating over non-loopback — bearer token travels in plaintext.
-        if target.host != "127.0.0.1" && target.host != "localhost" && target.host != "::1" {
+        // Read TLS config from the target workspace to decide scheme.
+        let target_tls_cert = std::fs::read_to_string(target.config_dir.join("config.toml"))
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("gateway")?
+                    .get("tls_cert")?
+                    .as_str()
+                    .map(String::from)
+            });
+
+        let scheme = if !is_loopback && target_tls_cert.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+
+        let url = format!("{scheme}://{}:{}/webhook", target.host, target.port);
+
+        // Warn if delegating over non-loopback without TLS.
+        if !is_loopback && scheme == "http" {
             tracing::warn!(
-                "Remote delegation to '{}' uses non-loopback host {} — bearer token is sent over plaintext HTTP",
+                "Remote delegation to '{}' uses non-loopback host {} over plaintext HTTP — bearer token is unencrypted",
                 remote_ws, target.host
             );
         }
 
-        let client = crate::config::build_runtime_proxy_client_with_timeouts(
-            "delegate.remote",
+        let client = build_peer_client(
+            self_config_dir,
+            remote_ws,
             DELEGATE_TIMEOUT_SECS,
-            10,
         );
 
         let resp = match client
@@ -614,6 +636,45 @@ impl DelegateTool {
             })
         }
     }
+}
+
+/// Build a reqwest client for peer delegation, optionally loading a custom
+/// CA certificate if the peer has deposited one during workspace cloning.
+///
+/// Falls back to the standard runtime-proxy client when no peer CA exists.
+fn build_peer_client(
+    self_config_dir: &std::path::Path,
+    peer_name: &str,
+    timeout_secs: u64,
+) -> reqwest::Client {
+    let peer_ca_path = self_config_dir
+        .join("tls")
+        .join("peers")
+        .join(format!("{peer_name}-ca.pem"));
+
+    if let Ok(pem_bytes) = std::fs::read(&peer_ca_path) {
+        if let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) {
+            if let Ok(client) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .add_root_certificate(cert)
+                .build()
+            {
+                tracing::debug!(
+                    "Using custom CA for peer '{}' from {}",
+                    peer_name,
+                    peer_ca_path.display()
+                );
+                return client;
+            }
+        }
+        tracing::warn!(
+            "Failed to parse peer CA certificate at {}; falling back to default client",
+            peer_ca_path.display()
+        );
+    }
+
+    crate::config::build_runtime_proxy_client_with_timeouts("delegate.remote", timeout_secs, 10)
 }
 
 struct ToolArcRef {
